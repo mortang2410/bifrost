@@ -3969,6 +3969,57 @@ func TestSelectKeyFromProviderForModelWithPool_SkipKeySelectionGatedOnBaseProvid
 	}
 }
 
+// TestSelectKeyFromProviderForModelWithPool_OpenAIOAuthPassthrough verifies that a
+// ChatGPT/Codex OAuth passthrough never selects a stored OpenAI key, while every
+// converted or non-passthrough OpenAI request still selects its configured key.
+// An empty pool is what lets the caller's forwarded Authorization header survive:
+// the provider only overwrites it when the selected key value is non-empty.
+func TestSelectKeyFromProviderForModelWithPool_OpenAIOAuthPassthrough(t *testing.T) {
+	account := NewMockAccount()
+	account.SetKeysForProvider(schemas.OpenAI, []schemas.Key{
+		{ID: "openai-key", Name: "openai-key", Value: schemas.SecretVar{Val: "sk-stored-api-key"}, Models: []string{"*"}, Weight: 1.0},
+	})
+	bifrost := &Bifrost{account: account, logger: NewDefaultLogger(schemas.LogLevelError)}
+
+	requestTypes := []schemas.RequestType{
+		schemas.PassthroughRequest,
+		schemas.PassthroughStreamRequest,
+		schemas.ResponsesRequest,
+		schemas.ResponsesStreamRequest,
+		schemas.ChatCompletionRequest,
+		schemas.ChatCompletionStreamRequest,
+		schemas.EmbeddingRequest,
+	}
+
+	for _, requestType := range requestTypes {
+		for _, skip := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/skip=%t", requestType, skip), func(t *testing.T) {
+				ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+				ctx.SetValue(schemas.BifrostContextKeySkipKeySelection, skip)
+
+				keys, canRotate, err := bifrost.selectKeyFromProviderForModelWithPool(ctx, requestType, schemas.OpenAI, "gpt-6-luna", schemas.OpenAI)
+				if err != nil {
+					t.Fatalf("selectKeyFromProviderForModelWithPool: %v", err)
+				}
+				if canRotate {
+					t.Error("canRotate = true, want false")
+				}
+
+				wantSkip := skip && (requestType == schemas.PassthroughRequest || requestType == schemas.PassthroughStreamRequest)
+				if wantSkip {
+					if len(keys) != 0 {
+						t.Fatalf("OAuth passthrough selected %d stored keys, want an empty pool", len(keys))
+					}
+					return
+				}
+				if len(keys) != 1 || keys[0].ID != "openai-key" {
+					t.Fatalf("got %v, want the configured OpenAI key", keys)
+				}
+			})
+		}
+	}
+}
+
 // Test that releaseChannelMessage clears all request-scoped references so an
 // idle pooled ChannelMessage cannot pin the parsed request body, the request
 // context, or an undelivered response/error.

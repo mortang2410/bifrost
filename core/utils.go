@@ -81,10 +81,16 @@ func CanProviderKeyValueBeEmpty(providerKey schemas.ModelProvider) bool {
 }
 
 // isKeySkippingAllowed gates SkipKeySelection on the provider this attempt resolved to. The flag
-// is set only for Claude Code OAuth passthrough, where the caller's token is the upstream
-// credential — and only the Anthropic provider forwards it.
-func isKeySkippingAllowed(baseProvider schemas.ModelProvider) bool {
-	return baseProvider == schemas.Anthropic
+// is set only where the caller's own OAuth token is the upstream credential: Claude Code
+// passthrough on Anthropic (native integration or raw passthrough), and ChatGPT/Codex OAuth
+// passthrough on OpenAI. OpenAI skipping is restricted to raw passthrough request types so a
+// configured provider key still serves converted routes such as /v1/chat/completions and any
+// non-passthrough fallback.
+func isKeySkippingAllowed(baseProvider schemas.ModelProvider, requestType schemas.RequestType) bool {
+	if baseProvider == schemas.Anthropic {
+		return true
+	}
+	return baseProvider == schemas.OpenAI && isPassthroughRequestType(requestType)
 }
 
 // calculateBackoff implements exponential backoff with jitter for retry attempts.

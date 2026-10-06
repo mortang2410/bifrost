@@ -10706,7 +10706,7 @@ func (bifrost *Bifrost) getKeysForBatchAndFileOps(ctx *schemas.BifrostContext, p
 // via the keyProvider closure built by the caller.
 //
 // canRotate=false is returned for cases where the caller must always use the same key:
-//   - SkipKeySelection (Claude Code OAuth passthrough to Anthropic; empty slice returned)
+//   - SkipKeySelection (caller-authenticated requests on supported providers; empty slice returned)
 //   - Explicit BifrostContextKeyAPIKeyID / APIKeyName (user pinned a specific key)
 //   - Session affinity (the registered policy named a key for the request's session). The
 //     pool is that key followed by the rest of the eligible keys, which the request moves to
@@ -10726,7 +10726,7 @@ func (bifrost *Bifrost) selectKeyFromProviderForModelWithPool(ctx *schemas.Bifro
 	}
 
 	// SkipKeySelection: the caller's OAuth token is the credential — return empty pool, no rotation.
-	if skipKeySelection, ok := ctx.Value(schemas.BifrostContextKeySkipKeySelection).(bool); ok && skipKeySelection && isKeySkippingAllowed(baseProviderType) {
+	if skipKeySelection, ok := ctx.Value(schemas.BifrostContextKeySkipKeySelection).(bool); ok && skipKeySelection && isKeySkippingAllowed(baseProviderType, requestType) {
 		return []schemas.Key{}, false, nil
 	}
 
