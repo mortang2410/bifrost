@@ -6,6 +6,7 @@ import (
 	"maps"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	"github.com/bytedance/sonic"
 	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -2184,6 +2186,476 @@ func TestConvertOpenAIMessagesToBifrostMessages_NormalizesReasoningSpellings(t *
 			require.NotNil(t, converted[0].ChatAssistantMessage.Reasoning,
 				"replayed reasoning must reach the Bifrost schema regardless of spelling")
 			require.Equal(t, reasoning, *converted[0].ChatAssistantMessage.Reasoning)
+		})
+	}
+}
+
+// reasoningDetailExpect describes one reasoning_details entry exactly as the
+// caller sent it; a nil pointer means that JSON key was absent. Comparing whole
+// entries rather than a count is what catches a normalization pass that rewrites
+// or drops the caller's metadata, which a count assertion cannot see.
+type reasoningDetailExpect struct {
+	index     int
+	typ       schemas.BifrostReasoningDetailsType
+	text      *string
+	summary   *string
+	signature *string
+	data      *string
+}
+
+// textDetailExpect is the common single-text detail.
+func textDetailExpect(index int, text string) reasoningDetailExpect {
+	return reasoningDetailExpect{index: index, typ: schemas.BifrostReasoningDetailsTypeText, text: &text}
+}
+
+func expectStr(s string) *string { return &s }
+
+// assertReasoningDetails compares the decoded details against the caller's
+// entries field by field, so a pass that keeps the count but rewrites text,
+// summary, signature, or data fails.
+func assertReasoningDetails(t *testing.T, want []reasoningDetailExpect, got []schemas.ChatReasoningDetails, context string) {
+	t.Helper()
+	require.Len(t, got, len(want), "%s: reasoning_details must be preserved exactly", context)
+	for i := range want {
+		w, g := want[i], got[i]
+		assert.Equal(t, w.index, g.Index, "%s: detail %d index", context, i)
+		assert.Equal(t, w.typ, g.Type, "%s: detail %d type", context, i)
+		assert.Equal(t, w.text, g.Text, "%s: detail %d text", context, i)
+		assert.Equal(t, w.summary, g.Summary, "%s: detail %d summary", context, i)
+		assert.Equal(t, w.signature, g.Signature, "%s: detail %d signature", context, i)
+		assert.Equal(t, w.data, g.Data, "%s: detail %d data", context, i)
+	}
+}
+
+// reasoningSelectionCase is one row of the shared case table: a name and the raw
+// caller message. What the row must produce is computed from the input by
+// referenceSelect, never stored.
+type reasoningSelectionCase struct {
+	name string
+	raw  string
+}
+
+// reasoningSelectionFixturePath is the one canonical case table both ingress
+// paths are tested against, relative to this package directory.
+//
+// The fixture stores inputs only. What each input must produce is computed by
+// the reference rule below, never stored beside the input, so editing the
+// fixture cannot bless wrong behavior: it changes the input, and the reference
+// recomputes the expectation from that input. A name-to-shape check, also code
+// rather than data, fails if a row's input stops exercising the scenario its
+// name promises.
+const reasoningSelectionFixturePath = "../../../testdata/reasoning_selection_cases.json"
+
+// reasoningSelectionFixture is one row of the shared table: a name and the raw
+// caller message.
+type reasoningSelectionFixture struct {
+	Name string `json:"name"`
+	Raw  string `json:"raw"`
+}
+
+// reasoningSelectionCaseNames is the canonical set of fixture rows, in order.
+var reasoningSelectionCaseNames = []string{
+	"details only",
+	"empty first detail then text",
+	"empty reasoning_content then detail text",
+	"empty reasoning then detail text",
+	"explicit reasoning_content wins",
+	"explicit reasoning wins",
+	"reasoning_content wins over reasoning",
+	"non-empty reasoning_content with empty reasoning and details",
+	"empty reasoning with non-empty reasoning_content and no details",
+	"empty reasoning with non-empty reasoning_content on a user turn",
+	"signature-only detail with no text",
+	"both explicit empty",
+	"both explicit non-empty with details",
+}
+
+// reasoningSelectionSelectsNothing names the rows whose input must select no
+// reasoning. It is checked against the reference rule's own verdict, so a
+// fixture edit that makes such a row start selecting fails.
+var reasoningSelectionSelectsNothing = []string{
+	"signature-only detail with no text",
+	"both explicit empty",
+}
+
+// parsedFixtureInput is the caller message decoded for the reference rule.
+type parsedFixtureInput struct {
+	Role             *string         `json:"role"`
+	Reasoning        *string         `json:"reasoning"`
+	ReasoningContent *string         `json:"reasoning_content"`
+	ReasoningDetails json.RawMessage `json:"reasoning_details"`
+}
+
+// fixtureDetail is one reasoning_details entry as the caller sent it.
+type fixtureDetail struct {
+	Index     int     `json:"index"`
+	Type      string  `json:"type"`
+	Text      *string `json:"text"`
+	Summary   *string `json:"summary"`
+	Signature *string `json:"signature"`
+	Data      *string `json:"data"`
+}
+
+// referenceSelection is what the documented rule says one input must produce,
+// derived from the input alone.
+type referenceSelection struct {
+	// selection is the reasoning text that must be selected, or nil for none.
+	selection *string
+	// callerDetails are the details the caller sent, unchanged; nil when the
+	// caller sent no reasoning_details array at all.
+	callerDetails []reasoningDetailExpect
+	// sentDetailsArray records whether the caller supplied the key.
+	sentDetailsArray bool
+}
+
+// referenceFirstNonEmpty returns the first present, non-empty candidate, or nil.
+// An empty string counts as absent.
+func referenceFirstNonEmpty(candidates ...*string) *string {
+	for _, c := range candidates {
+		if c != nil && *c != "" {
+			return c
+		}
+	}
+	return nil
+}
+
+// referenceSelect implements the documented selection rule independently of the
+// production code: first non-empty of reasoning_content then reasoning, then, on
+// an assistant turn only, the first non-empty detail text. An empty explicit
+// value counts as absent. The caller's details are returned unchanged.
+func referenceSelect(t *testing.T, raw string) referenceSelection {
+	t.Helper()
+	var in parsedFixtureInput
+	require.NoError(t, sonic.Unmarshal([]byte(raw), &in), "fixture input must be valid JSON")
+
+	ref := referenceSelection{sentDetailsArray: in.ReasoningDetails != nil}
+	if ref.sentDetailsArray {
+		var decoded []fixtureDetail
+		require.NoError(t, sonic.Unmarshal(in.ReasoningDetails, &decoded),
+			"fixture reasoning_details must be an array")
+		ref.callerDetails = make([]reasoningDetailExpect, 0, len(decoded))
+		for _, d := range decoded {
+			ref.callerDetails = append(ref.callerDetails, reasoningDetailExpect{
+				index:     d.Index,
+				typ:       schemas.BifrostReasoningDetailsType(d.Type),
+				text:      d.Text,
+				summary:   d.Summary,
+				signature: d.Signature,
+				data:      d.Data,
+			})
+		}
+	}
+
+	ref.selection = referenceFirstNonEmpty(in.ReasoningContent, in.Reasoning)
+	if ref.selection == nil && in.Role != nil && *in.Role == string(schemas.ChatMessageRoleAssistant) {
+		for _, d := range ref.callerDetails {
+			if d.text != nil && *d.text != "" {
+				text := *d.text
+				ref.selection = &text
+				break
+			}
+		}
+	}
+	return ref
+}
+
+// referenceInputShape asserts that a row's input still exercises the scenario its
+// name promises. This is code, not fixture data, so a fixture edit that empties a
+// scenario fails here instead of passing quietly.
+func referenceInputShape(t *testing.T, name string, in parsedFixtureInput, details []reasoningDetailExpect, sentArray bool) {
+	t.Helper()
+
+	emptyPresent := func(p *string) bool { return p != nil && *p == "" }
+	nonEmpty := func(p *string) bool { return p != nil && *p != "" }
+	firstTextEmpty := func() bool {
+		return len(details) >= 1 && (details[0].text == nil || *details[0].text == "")
+	}
+	firstTextNonEmpty := func() bool {
+		return len(details) >= 1 && details[0].text != nil && *details[0].text != ""
+	}
+	isAssistant := in.Role != nil && *in.Role == string(schemas.ChatMessageRoleAssistant)
+
+	fail := func(why string) {
+		t.Fatalf("row %q no longer exercises its scenario: %s", name, why)
+	}
+
+	switch name {
+	case "details only":
+		if in.Reasoning != nil || in.ReasoningContent != nil || !firstTextNonEmpty() {
+			fail("expected no explicit spelling and a first detail with non-empty text")
+		}
+	case "empty first detail then text":
+		if in.Reasoning != nil || in.ReasoningContent != nil || len(details) < 2 ||
+			!firstTextEmpty() || details[0].signature == nil || !firstTextNonEmptyAt(details, 1) {
+			fail("expected an empty first detail with a signature followed by a non-empty detail")
+		}
+	case "empty reasoning_content then detail text":
+		if !emptyPresent(in.ReasoningContent) || !firstTextNonEmpty() {
+			fail("expected an empty reasoning_content and a non-empty detail text")
+		}
+	case "empty reasoning then detail text":
+		if !emptyPresent(in.Reasoning) || !firstTextNonEmpty() {
+			fail("expected an empty reasoning and a non-empty detail text")
+		}
+	case "explicit reasoning_content wins":
+		if !nonEmpty(in.ReasoningContent) || len(details) == 0 {
+			fail("expected a non-empty reasoning_content alongside details")
+		}
+	case "explicit reasoning wins":
+		if !nonEmpty(in.Reasoning) || in.ReasoningContent != nil || len(details) == 0 {
+			fail("expected a non-empty reasoning alone, with details")
+		}
+	case "reasoning_content wins over reasoning":
+		if !nonEmpty(in.ReasoningContent) || !nonEmpty(in.Reasoning) || sentArray {
+			fail("expected both explicit spellings non-empty and no details array")
+		}
+	case "non-empty reasoning_content with empty reasoning and details":
+		if !nonEmpty(in.ReasoningContent) || !emptyPresent(in.Reasoning) || len(details) == 0 {
+			fail("expected non-empty reasoning_content with an empty reasoning and details")
+		}
+	case "empty reasoning with non-empty reasoning_content and no details":
+		if !isAssistant || !emptyPresent(in.Reasoning) || !nonEmpty(in.ReasoningContent) || sentArray {
+			fail("expected an assistant turn with an empty reasoning, non-empty reasoning_content, no details")
+		}
+	case "empty reasoning with non-empty reasoning_content on a user turn":
+		if in.Role == nil || *in.Role != string(schemas.ChatMessageRoleUser) ||
+			!emptyPresent(in.Reasoning) || !nonEmpty(in.ReasoningContent) {
+			fail("expected a user turn with an empty reasoning and a non-empty reasoning_content")
+		}
+	case "signature-only detail with no text":
+		if in.Reasoning != nil || in.ReasoningContent != nil || len(details) != 1 ||
+			!firstTextEmpty() || details[0].signature == nil || details[0].summary != nil || details[0].data != nil {
+			fail("expected one signature-only detail with no text, summary, or data")
+		}
+	case "both explicit empty":
+		if !emptyPresent(in.Reasoning) || !emptyPresent(in.ReasoningContent) || sentArray {
+			fail("expected both explicit spellings present and empty, with no details array")
+		}
+	case "both explicit non-empty with details":
+		if !nonEmpty(in.Reasoning) || !nonEmpty(in.ReasoningContent) || len(details) == 0 {
+			fail("expected both explicit spellings non-empty, with details")
+		}
+	default:
+		t.Fatalf("row %q has no shape check; add one so its scenario cannot be emptied", name)
+	}
+}
+
+// firstTextNonEmptyAt reports whether the detail at i carries non-empty text.
+func firstTextNonEmptyAt(details []reasoningDetailExpect, i int) bool {
+	return i < len(details) && details[i].text != nil && *details[i].text != ""
+}
+
+// normalizeFixtureInput renders a fixture input in a canonical form, so two
+// inputs that differ only in whitespace or key order compare equal.
+//
+// Numbers are kept as their original literals via UseNumber. Decoding them into
+// any would convert them to float64, which rounds distinct large integers to the
+// same value.
+func normalizeFixtureInput(t *testing.T, raw string) string {
+	t.Helper()
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	var decoded any
+	require.NoError(t, dec.Decode(&decoded), "fixture input must be valid JSON")
+	out, err := json.Marshal(decoded)
+	require.NoError(t, err)
+	return string(out)
+}
+
+// loadReasoningSelectionCases reads the shared fixture and validates it: the row
+// names must be exactly the canonical set in order, every input must be distinct
+// after normalization, and every input must still exercise the scenario its name
+// promises. The expectations themselves are not read from the file; the tests
+// compute them with referenceSelect.
+func loadReasoningSelectionCases(t *testing.T) []reasoningSelectionCase {
+	t.Helper()
+	data, err := os.ReadFile(reasoningSelectionFixturePath)
+	require.NoError(t, err, "the shared reasoning selection fixture must be readable")
+	var rows []reasoningSelectionFixture
+	require.NoError(t, sonic.Unmarshal(data, &rows), "the shared fixture must be valid JSON")
+
+	names := make([]string, 0, len(rows))
+	inputs := map[string]string{}
+	cases := make([]reasoningSelectionCase, 0, len(rows))
+	for _, r := range rows {
+		names = append(names, r.Name)
+		require.NotEmpty(t, r.Raw, "row %q must carry an input", r.Name)
+
+		normalized := normalizeFixtureInput(t, r.Raw)
+		if prior, dup := inputs[normalized]; dup {
+			t.Fatalf("rows %q and %q carry the same input; a duplicate row drops coverage", prior, r.Name)
+		}
+		inputs[normalized] = r.Name
+
+		var in parsedFixtureInput
+		require.NoError(t, sonic.Unmarshal([]byte(r.Raw), &in), "row %q input must be valid JSON", r.Name)
+		ref := referenceSelect(t, r.Raw)
+		referenceInputShape(t, r.Name, in, ref.callerDetails, ref.sentDetailsArray)
+
+		cases = append(cases, reasoningSelectionCase{name: r.Name, raw: r.Raw})
+	}
+
+	require.Equal(t, reasoningSelectionCaseNames, names,
+		"the shared fixture must carry exactly the canonical rows, in order")
+	return cases
+}
+
+// assertReferenceSelectsNothing checks the reference rule's verdict for the rows
+// that must select no reasoning, so a fixture edit that makes one of them start
+// selecting fails even though the reference recomputes from the new input.
+func assertReferenceSelectsNothing(t *testing.T) {
+	t.Helper()
+	cases := loadReasoningSelectionCases(t)
+	got := map[string]bool{}
+	for _, tc := range cases {
+		if referenceSelect(t, tc.raw).selection == nil {
+			got[tc.name] = true
+		}
+	}
+	for _, name := range reasoningSelectionSelectsNothing {
+		assert.True(t, got[name], "row %q must select no reasoning", name)
+		delete(got, name)
+	}
+	assert.Empty(t, got, "these rows select no reasoning but are not listed as such: %v", got)
+}
+
+// TestOpenAIConverterReasoningSelection pins the integration-mount selection rule
+// across the same case table as the native-ingress half in
+// transports/bifrost-http/handlers (TestNativeChatIngressReasoningSelection): the
+// first non-empty reasoning text wins, an empty explicit value counts as absent,
+// and an explicit non-empty value beats the details. Both read the same fixture,
+// so a client must not get different replayed reasoning depending on which
+// endpoint spelling it used.
+//
+// The expectation is computed by referenceSelect from the input alone, so it is
+// the documented rule rather than a stored value, and each row asserts the whole
+// decoded detail list so a pass that rewrites or drops caller metadata fails.
+func TestOpenAIConverterReasoningSelection(t *testing.T) {
+	for _, tc := range loadReasoningSelectionCases(t) {
+		t.Run(tc.name, func(t *testing.T) {
+			ref := referenceSelect(t, tc.raw)
+			var msg OpenAIMessage
+			require.NoError(t, sonic.Unmarshal([]byte(tc.raw), &msg))
+
+			converted := ConvertOpenAIMessagesToBifrostMessages([]OpenAIMessage{msg})
+			require.Len(t, converted, 1)
+			assistant := converted[0].ChatAssistantMessage
+
+			if ref.selection == nil && !ref.sentDetailsArray {
+				require.NotNil(t, assistant)
+				assert.Nil(t, assistant.Reasoning,
+					"an all-empty reasoning input must select nothing")
+				assert.Empty(t, assistant.ReasoningDetails,
+					"an all-empty reasoning input must keep no details")
+				return
+			}
+
+			require.NotNil(t, assistant)
+			if ref.selection == nil {
+				assert.Nil(t, assistant.Reasoning,
+					"the integration mount must select nothing when no spelling carries text")
+			} else {
+				require.NotNil(t, assistant.Reasoning,
+					"the integration mount must select replayed reasoning")
+				assert.Equal(t, *ref.selection, *assistant.Reasoning,
+					"the integration mount selected the wrong reasoning text")
+			}
+
+			if ref.sentDetailsArray {
+				assertReasoningDetails(t, ref.callerDetails, assistant.ReasoningDetails, tc.name)
+				return
+			}
+			assert.Empty(t, assistant.ReasoningDetails,
+				"the integration mount leaves details nil when the caller sent none")
+		})
+	}
+}
+
+// TestOpenAIConverterReasoningSelectionFixtureIntegrity guards the shared fixture.
+// The loader already rejects an empty file, a reordered or truncated row set, a
+// duplicated input, and a row whose input stops exercising its named scenario;
+// this test names those guarantees and checks that exactly the rows which must
+// select nothing do so.
+func TestOpenAIConverterReasoningSelectionFixtureIntegrity(t *testing.T) {
+	cases := loadReasoningSelectionCases(t)
+	require.Len(t, cases, len(reasoningSelectionCaseNames))
+	for _, tc := range cases {
+		assert.NotEmpty(t, tc.raw, "row %q must carry an input", tc.name)
+	}
+	assertReferenceSelectsNothing(t)
+}
+
+// TestOpenAIConverterOnlyFoldsReasoningOntoAssistantTurns pins the role gate on
+// the integration mount. A user, system, or tool turn carrying reasoning_details
+// must keep the details for inspection but must not gain Reasoning, which would
+// put a reasoning_content key on the provider wire for a role that has no such
+// field.
+func TestOpenAIConverterOnlyFoldsReasoningOntoAssistantTurns(t *testing.T) {
+	cases := map[string]string{
+		"user":   `{"role":"user","reasoning_details":[{"index":0,"type":"reasoning.text","text":"USER-MARK"}]}`,
+		"system": `{"role":"system","reasoning_details":[{"index":0,"type":"reasoning.text","text":"SYS-MARK"}]}`,
+		"tool":   `{"role":"tool","tool_call_id":"c1","reasoning_details":[{"index":0,"type":"reasoning.text","text":"TOOL-MARK"}]}`,
+	}
+	for role, raw := range cases {
+		t.Run(role, func(t *testing.T) {
+			var msg OpenAIMessage
+			require.NoError(t, sonic.Unmarshal([]byte(raw), &msg))
+
+			converted := ConvertOpenAIMessagesToBifrostMessages([]OpenAIMessage{msg})
+			require.Len(t, converted, 1)
+			require.NotNil(t, converted[0].ChatAssistantMessage)
+			assert.Nil(t, converted[0].ChatAssistantMessage.Reasoning,
+				"a %s turn must not have reasoning_details text folded onto Reasoning", role)
+
+			ctx, cancel := schemas.NewBifrostContextWithCancel(nil)
+			defer cancel()
+			wireBody, err := sonic.Marshal(ToOpenAIChatRequest(ctx, &schemas.BifrostChatRequest{
+				Provider: schemas.OpenAI,
+				Model:    "m",
+				Input:    converted,
+			}))
+			require.NoError(t, err)
+			var decoded map[string]any
+			require.NoError(t, sonic.Unmarshal(wireBody, &decoded))
+			messages := decoded["messages"].([]any)
+			require.Len(t, messages, 1)
+			assert.NotContains(t, messages[0], "reasoning_content",
+				"a %s turn must not reach the provider with reasoning_content", role)
+		})
+	}
+}
+
+// TestOpenAIConverterFoldsExplicitReasoningForAnyRole pins the exact scope of the
+// assistant-role gate: only the reasoning_details fallback is assistant-scoped. An
+// explicit reasoning or reasoning_content value is still folded whatever the role,
+// because that is what the shared schema decoder does on the native path and the
+// two paths must not diverge. Gating the explicit fold too would silently drop
+// replayed reasoning that a caller sent directly.
+func TestOpenAIConverterFoldsExplicitReasoningForAnyRole(t *testing.T) {
+	cases := map[string]struct {
+		raw  string
+		want string
+	}{
+		"user":      {raw: `{"role":"user","reasoning_content":"RC-MARK"}`, want: "RC-MARK"},
+		"system":    {raw: `{"role":"system","reasoning":"R-MARK"}`, want: "R-MARK"},
+		"tool":      {raw: `{"role":"tool","tool_call_id":"c1","reasoning_content":"RC-MARK"}`, want: "RC-MARK"},
+		"no role":   {raw: `{"reasoning_content":"RC-MARK"}`, want: "RC-MARK"},
+		"assistant": {raw: `{"role":"assistant","reasoning_content":"RC-MARK"}`, want: "RC-MARK"},
+	}
+	for role, tc := range cases {
+		t.Run(role, func(t *testing.T) {
+			var msg OpenAIMessage
+			require.NoError(t, sonic.Unmarshal([]byte(tc.raw), &msg))
+
+			converted := ConvertOpenAIMessagesToBifrostMessages([]OpenAIMessage{msg})
+			require.Len(t, converted, 1)
+			require.NotNil(t, converted[0].ChatAssistantMessage)
+			require.NotNil(t, converted[0].ChatAssistantMessage.Reasoning,
+				"an explicit reasoning value must be folded regardless of role")
+			// Assert the exact value, not merely that something was selected: a fold
+			// that returned the wrong text would otherwise pass.
+			assert.Equal(t, tc.want, *converted[0].ChatAssistantMessage.Reasoning,
+				"the integration mount must keep the caller's explicit reasoning value verbatim")
 		})
 	}
 }

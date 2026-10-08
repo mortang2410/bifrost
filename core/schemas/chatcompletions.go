@@ -1629,6 +1629,11 @@ func (cm ChatAssistantMessage) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON implements custom unmarshalling for ChatAssistantMessage.
 // If Reasoning is non-nil and ReasoningDetails is nil/empty, it adds a single
 // ChatReasoningDetails entry of type "reasoning.text" with the text set to Reasoning.
+//
+// This type is both the request and the response shape, so it deliberately does
+// NOT promote reasoning_details text into Reasoning. Doing so here would rewrite
+// provider responses as they are decoded. Native request ingress performs that
+// promotion in the handlers package, on the request type only.
 func (cm *ChatAssistantMessage) UnmarshalJSON(data []byte) error {
 	if cm == nil {
 		return nil
