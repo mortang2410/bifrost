@@ -168,13 +168,30 @@ func ConvertOpenAIMessagesToBifrostMessages(messages []OpenAIMessage) []schemas.
 			// Callers replay assistant reasoning under any of three keys. Normalize them
 			// onto Reasoning so downstream provider logic sees replayed reasoning
 			// regardless of spelling — DeepSeek in particular gates thinking on it.
-			reasoning := message.OpenAIChatAssistantMessage.Reasoning
-			if reasoning == nil {
-				reasoning = message.OpenAIChatAssistantMessage.ReasoningAlias
+			//
+			// An empty explicit value counts as absent: a message that sent
+			// `reasoning_content: ""` alongside a reasoning_details entry used to keep
+			// the empty string and lose the detail text, while the native ingress path
+			// promoted it. The explicit value itself is folded for any role, matching
+			// the schema decoder; only the reasoning_details fallback is
+			// assistant-scoped, because reasoning_details is what a non-assistant turn
+			// must never turn into reasoning_content on the wire.
+			var reasoning *string
+			for _, candidate := range []*string{
+				message.OpenAIChatAssistantMessage.Reasoning,
+				message.OpenAIChatAssistantMessage.ReasoningAlias,
+			} {
+				if candidate != nil && *candidate != "" {
+					reasoning = candidate
+					break
+				}
 			}
-			if reasoning == nil {
+			if reasoning == nil && message.Role == schemas.ChatMessageRoleAssistant {
 				for _, detail := range message.OpenAIChatAssistantMessage.ReasoningDetails {
-					if detail.Text != nil {
+					// First non-empty text, matching the native request ingress
+					// in the handlers package. An empty text on an earlier detail
+					// (it may still carry a signature) must not win the selection.
+					if detail.Text != nil && *detail.Text != "" {
 						reasoning = detail.Text
 						break
 					}

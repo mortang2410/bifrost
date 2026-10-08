@@ -1,0 +1,54 @@
+[
+  {
+    "name": "details only",
+    "raw": "{\"role\":\"assistant\",\"reasoning_details\":[{\"index\":0,\"type\":\"reasoning.text\",\"text\":\"DETAIL-MARK\"}]}"
+  },
+  {
+    "name": "empty first detail then text",
+    "raw": "{\"role\":\"assistant\",\"reasoning_details\":[{\"index\":0,\"type\":\"reasoning.text\",\"text\":\"\",\"signature\":\"sig-abc\"},{\"index\":1,\"type\":\"reasoning.text\",\"text\":\"LATER-MARK\"}]}"
+  },
+  {
+    "name": "empty reasoning_content then detail text",
+    "raw": "{\"role\":\"assistant\",\"reasoning_content\":\"\",\"reasoning_details\":[{\"index\":0,\"type\":\"reasoning.text\",\"text\":\"FALLBACK-MARK\"}]}"
+  },
+  {
+    "name": "empty reasoning then detail text",
+    "raw": "{\"role\":\"assistant\",\"reasoning\":\"\",\"reasoning_details\":[{\"index\":0,\"type\":\"reasoning.text\",\"text\":\"FALLBACK-MARK\"}]}"
+  },
+  {
+    "name": "explicit reasoning_content wins",
+    "raw": "{\"role\":\"assistant\",\"reasoning_content\":\"EXPLICIT\",\"reasoning_details\":[{\"index\":0,\"type\":\"reasoning.text\",\"text\":\"DETAIL-MARK\"}]}"
+  },
+  {
+    "name": "explicit reasoning wins",
+    "raw": "{\"role\":\"assistant\",\"reasoning\":\"EXPLICIT\",\"reasoning_details\":[{\"index\":0,\"type\":\"reasoning.text\",\"text\":\"DETAIL-MARK\"}]}"
+  },
+  {
+    "name": "reasoning_content wins over reasoning",
+    "raw": "{\"role\":\"assistant\",\"reasoning_content\":\"RC-MARK\",\"reasoning\":\"R-MARK\"}"
+  },
+  {
+    "name": "non-empty reasoning_content with empty reasoning and details",
+    "raw": "{\"role\":\"assistant\",\"reasoning_content\":\"PRIMARY-MARK\",\"reasoning\":\"\",\"reasoning_details\":[{\"index\":0,\"type\":\"reasoning.text\",\"text\":\"DETAIL-MARK\"}]}"
+  },
+  {
+    "name": "empty reasoning with non-empty reasoning_content and no details",
+    "raw": "{\"role\":\"assistant\",\"reasoning\":\"\",\"reasoning_content\":\"PRIMARY-MARK\"}"
+  },
+  {
+    "name": "empty reasoning with non-empty reasoning_content on a user turn",
+    "raw": "{\"role\":\"user\",\"reasoning\":\"\",\"reasoning_content\":\"PRIMARY-MARK\"}"
+  },
+  {
+    "name": "signature-only detail with no text",
+    "raw": "{\"role\":\"assistant\",\"reasoning_details\":[{\"index\":0,\"type\":\"reasoning.text\",\"signature\":\"sig-only\"}]}"
+  },
+  {
+    "name": "both explicit empty",
+    "raw": "{\"role\":\"assistant\",\"reasoning\":\"\",\"reasoning_content\":\"\"}"
+  },
+  {
+    "name": "both explicit non-empty with details",
+    "raw": "{\"role\":\"assistant\",\"reasoning\":\"R-MARK\",\"reasoning_content\":\"RC-MARK\",\"reasoning_details\":[{\"index\":0,\"type\":\"reasoning.text\",\"text\":\"DETAIL-MARK\"}]}"
+  }
+]
