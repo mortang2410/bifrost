@@ -134,6 +134,52 @@ func TestReasoningContentAliasIsEmittedOnOutput(t *testing.T) {
 	})
 }
 
+// ChatAssistantMessage is both the request and the response shape: it is what
+// provider responses decode into, via BifrostResponseChoice. The native request
+// path promotes reasoning_details text onto Reasoning in the handlers package,
+// and that promotion must not leak into this shared decoder, or every provider
+// response carrying only reasoning_details would be rewritten as it arrives and
+// clients would suddenly see an extra reasoning/reasoning_content key.
+func TestAssistantReasoningDetailsOnlyResponseIsNotRewritten(t *testing.T) {
+	raw := `{"role":"assistant","content":"answer","reasoning_details":[{"index":0,"type":"reasoning.text","text":"RESP-MARK","signature":"sig-marker"}]}`
+
+	var message ChatMessage
+	require.NoError(t, Unmarshal([]byte(raw), &message))
+	require.NotNil(t, message.ChatAssistantMessage)
+	assert.Nil(t, message.ChatAssistantMessage.Reasoning,
+		"the shared decoder must not promote reasoning_details text; response decoding is not request ingress")
+	require.Len(t, message.ChatAssistantMessage.ReasoningDetails, 1,
+		"the original reasoning detail must reach the client untouched")
+
+	encoded, err := json.Marshal(message)
+	require.NoError(t, err)
+
+	var decoded map[string]any
+	require.NoError(t, json.Unmarshal(encoded, &decoded))
+	assert.NotContains(t, decoded, "reasoning",
+		"a details-only provider response must not gain a reasoning key on the way out")
+	assert.NotContains(t, decoded, "reasoning_content",
+		"a details-only provider response must not gain a reasoning_content key on the way out")
+	require.NotNil(t, decoded["reasoning_details"],
+		"the response must still carry the reasoning_details it arrived with")
+}
+
+func TestAssistantEmptyReasoningTextWithMetadataRemainsAbsent(t *testing.T) {
+	raw := `{"reasoning":"","reasoning_content":"","reasoning_details":[{"index":0,"type":"reasoning.text","text":"","summary":"summary-abc","signature":"sig-abc","data":"data-abc"}]}`
+
+	var assistant ChatAssistantMessage
+	require.NoError(t, Unmarshal([]byte(raw), &assistant))
+	assert.Nil(t, assistant.Reasoning, "empty reasoning must stay absent")
+	require.Len(t, assistant.ReasoningDetails, 1,
+		"details carrying a signature must survive even when their text is empty")
+	require.NotNil(t, assistant.ReasoningDetails[0].Signature)
+	require.NotNil(t, assistant.ReasoningDetails[0].Summary)
+	require.NotNil(t, assistant.ReasoningDetails[0].Data)
+	assert.Equal(t, "summary-abc", *assistant.ReasoningDetails[0].Summary)
+	assert.Equal(t, "sig-abc", *assistant.ReasoningDetails[0].Signature)
+	assert.Equal(t, "data-abc", *assistant.ReasoningDetails[0].Data)
+}
+
 // ModelScope (and other DeepSeek-shaped upstreams) keep sending reasoning_content
 // as an empty string on every content-phase chunk once thinking has finished.
 // Bifrost amplified that noise instead of dropping it: UnmarshalJSON folded the
@@ -227,4 +273,3 @@ func TestEmptyReasoningNoiseIsNotAmplified(t *testing.T) {
 		assert.Equal(t, "We", decoded["reasoning_content"])
 	})
 }
-
