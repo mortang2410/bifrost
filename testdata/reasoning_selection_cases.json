@@ -48,6 +48,10 @@
     "raw": "{\"role\":\"assistant\",\"reasoning\":\"\",\"reasoning_content\":\"\"}"
   },
   {
+    "name": "explicit reasoning_content with empty details array",
+    "raw": "{\"role\":\"assistant\",\"reasoning_content\":\"EMPTY-ARRAY-MARK\",\"reasoning_details\":[]}"
+  },
+  {
     "name": "both explicit non-empty with details",
     "raw": "{\"role\":\"assistant\",\"reasoning\":\"R-MARK\",\"reasoning_content\":\"RC-MARK\",\"reasoning_details\":[{\"index\":0,\"type\":\"reasoning.text\",\"text\":\"DETAIL-MARK\"}]}"
   }

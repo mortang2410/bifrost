@@ -201,6 +201,7 @@ var reasoningSelectionCaseNames = []string{
 	"empty reasoning with non-empty reasoning_content on a user turn",
 	"signature-only detail with no text",
 	"both explicit empty",
+	"explicit reasoning_content with empty details array",
 	"both explicit non-empty with details",
 }
 
@@ -236,9 +237,11 @@ type referenceSelection struct {
 	// selection is the reasoning text that must be selected, or nil for none.
 	selection *string
 	// callerDetails are the details the caller sent, unchanged; nil when the
-	// caller sent no reasoning_details array at all.
+	// caller sent no non-empty reasoning_details array.
 	callerDetails []reasoningDetailExpect
-	// sentDetailsArray records whether the caller supplied the key.
+	// sentDetailsArray records whether the caller supplied a non-empty details
+	// array. An explicitly empty array counts as absent: it supplies no detail
+	// text, so the native seam synthesizes one detail from the winning value.
 	sentDetailsArray bool
 }
 
@@ -262,11 +265,15 @@ func referenceSelect(t *testing.T, raw string) referenceSelection {
 	var in parsedFixtureInput
 	require.NoError(t, sonic.Unmarshal([]byte(raw), &in), "fixture input must be valid JSON")
 
-	ref := referenceSelection{sentDetailsArray: in.ReasoningDetails != nil}
-	if ref.sentDetailsArray {
-		var decoded []fixtureDetail
+	// An explicitly empty array is treated as no array: it supplies no detail
+	// text, so the native seam synthesizes one detail from the winning value.
+	var decoded []fixtureDetail
+	if in.ReasoningDetails != nil {
 		require.NoError(t, sonic.Unmarshal(in.ReasoningDetails, &decoded),
 			"fixture reasoning_details must be an array")
+	}
+	ref := referenceSelection{sentDetailsArray: len(decoded) > 0}
+	if ref.sentDetailsArray {
 		ref.callerDetails = make([]reasoningDetailExpect, 0, len(decoded))
 		for _, d := range decoded {
 			ref.callerDetails = append(ref.callerDetails, reasoningDetailExpect{
@@ -332,16 +339,23 @@ func referenceInputShape(t *testing.T, name string, in parsedFixtureInput, detai
 			fail("expected an empty reasoning and a non-empty detail text")
 		}
 	case "explicit reasoning_content wins":
-		if !nonEmpty(in.ReasoningContent) || len(details) == 0 {
-			fail("expected a non-empty reasoning_content alongside details")
+		// The explicit value and the detail text compete here, so they must
+		// differ: if they were equal, reversing the precedence would still pass.
+		if !nonEmpty(in.ReasoningContent) || len(details) == 0 ||
+			!firstTextNonEmpty() || *in.ReasoningContent == *details[0].text {
+			fail("expected a non-empty reasoning_content that differs from the first detail text")
 		}
 	case "explicit reasoning wins":
-		if !nonEmpty(in.Reasoning) || in.ReasoningContent != nil || len(details) == 0 {
-			fail("expected a non-empty reasoning alone, with details")
+		if !nonEmpty(in.Reasoning) || in.ReasoningContent != nil || len(details) == 0 ||
+			!firstTextNonEmpty() || *in.Reasoning == *details[0].text {
+			fail("expected a non-empty reasoning that differs from the first detail text")
 		}
 	case "reasoning_content wins over reasoning":
-		if !nonEmpty(in.ReasoningContent) || !nonEmpty(in.Reasoning) || sentArray {
-			fail("expected both explicit spellings non-empty and no details array")
+		// Both spellings compete, so they must differ: if they were equal,
+		// reversing the precedence would still pass.
+		if !nonEmpty(in.ReasoningContent) || !nonEmpty(in.Reasoning) || sentArray ||
+			*in.ReasoningContent == *in.Reasoning {
+			fail("expected both explicit spellings non-empty, differing, and no details array")
 		}
 	case "non-empty reasoning_content with empty reasoning and details":
 		if !nonEmpty(in.ReasoningContent) || !emptyPresent(in.Reasoning) || len(details) == 0 {
@@ -365,9 +379,20 @@ func referenceInputShape(t *testing.T, name string, in parsedFixtureInput, detai
 		if !emptyPresent(in.Reasoning) || !emptyPresent(in.ReasoningContent) || sentArray {
 			fail("expected both explicit spellings present and empty, with no details array")
 		}
+	case "explicit reasoning_content with empty details array":
+		// The array must be present and empty, so this row keeps pinning that an
+		// explicitly empty array is treated as no array.
+		if !nonEmpty(in.ReasoningContent) || in.ReasoningDetails == nil ||
+			sentArray || len(details) != 0 {
+			fail("expected a non-empty reasoning_content with an explicitly empty details array")
+		}
 	case "both explicit non-empty with details":
-		if !nonEmpty(in.Reasoning) || !nonEmpty(in.ReasoningContent) || len(details) == 0 {
-			fail("expected both explicit spellings non-empty, with details")
+		// Both spellings compete, so they must differ, and the winner must also
+		// differ from the detail text, so every precedence edge stays detectable.
+		if !nonEmpty(in.Reasoning) || !nonEmpty(in.ReasoningContent) || len(details) == 0 ||
+			!firstTextNonEmpty() || *in.ReasoningContent == *in.Reasoning ||
+			*in.ReasoningContent == *details[0].text {
+			fail("expected both explicit spellings non-empty and differing, with differing details")
 		}
 	default:
 		t.Fatalf("row %q has no shape check; add one so its scenario cannot be emptied", name)
@@ -510,9 +535,16 @@ func TestNativeChatIngressReasoningSelection(t *testing.T) {
 			}
 			require.Len(t, assistant.ReasoningDetails, 1,
 				"exactly one detail must be synthesized for the selected value")
-			require.NotNil(t, assistant.ReasoningDetails[0].Text)
-			assert.Equal(t, *ref.selection, *assistant.ReasoningDetails[0].Text,
-				"the synthesized detail text must match the selected reasoning")
+			// Assert the whole entry, not just its text: a synthesized detail that
+			// changes type or index still carries the right text.
+			assert.Equal(t, textDetailExpect(0, *ref.selection), reasoningDetailExpect{
+				index:     assistant.ReasoningDetails[0].Index,
+				typ:       assistant.ReasoningDetails[0].Type,
+				text:      assistant.ReasoningDetails[0].Text,
+				summary:   assistant.ReasoningDetails[0].Summary,
+				signature: assistant.ReasoningDetails[0].Signature,
+				data:      assistant.ReasoningDetails[0].Data,
+			}, "the synthesized detail must be a reasoning.text entry at index 0")
 		})
 	}
 }
