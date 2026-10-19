@@ -474,7 +474,7 @@ func (cr *ChatRequest) UnmarshalJSON(data []byte) error {
 	if err := sonic.Unmarshal(data, &rawStruct); err != nil {
 		return err
 	}
-	normalizeNativeReasoning(cr.Messages, rawStruct.Messages)
+	normalizeNativeReasoning(cr.Model, cr.Messages, rawStruct.Messages)
 
 	// Unmarshal ChatParameters (which has its own custom unmarshaller)
 	if cr.ChatParameters == nil {
@@ -521,7 +521,7 @@ type nativeRawReasoning struct {
 // any role, matching the schema decoder and the OpenAI converter; the
 // reasoning_details fallback is assistant-only, because details are what a user,
 // system, or tool turn must never turn into reasoning_content on the wire.
-func normalizeNativeReasoning(messages []schemas.ChatMessage, raw []nativeRawReasoning) {
+func normalizeNativeReasoning(model string, messages []schemas.ChatMessage, raw []nativeRawReasoning) {
 	for i := range messages {
 		if i >= len(raw) {
 			continue
@@ -557,6 +557,21 @@ func normalizeNativeReasoning(messages []schemas.ChatMessage, raw []nativeRawRea
 			}
 		}
 
+		// DeepSeek-shaped thinking mode also rejects an assistant tool-call turn
+		// that replays no reasoning at all, and rejects an empty replay too: a
+		// request with the field absent or empty fails with "The `reasoning_content`
+		// in the thinking mode must be passed back to the API", while any non-empty
+		// text passes. The caller may hold no reasoning for such a turn, because the
+		// model produced none or a gateway dropped it, so a minimal placeholder keeps
+		// the turn replayable instead of failing the whole request.
+		if assistant.Reasoning == nil &&
+			messages[i].Role == schemas.ChatMessageRoleAssistant &&
+			len(assistant.ToolCalls) > 0 &&
+			requiresReasoningReplay(model) {
+			placeholder := reasoningReplayPlaceholder
+			assistant.Reasoning = &placeholder
+		}
+
 		// When the caller sent no details array, the decoder synthesized one from
 		// the value it saw before this normalization, which may be the losing
 		// spelling. Rebuild it from the value that actually wins so the replayed
@@ -570,6 +585,19 @@ func normalizeNativeReasoning(messages []schemas.ChatMessage, raw []nativeRawRea
 			}}
 		}
 	}
+}
+
+// reasoningReplayPlaceholder is the reasoning text replayed on an assistant
+// tool-call turn whose real reasoning is unavailable. One character, because a
+// thinking-mode upstream treats an empty string as missing.
+const reasoningReplayPlaceholder = "."
+
+// requiresReasoningReplay reports whether the request model reaches an upstream
+// that enforces the reasoning replay contract. Only DeepSeek-shaped routes were
+// measured to reject an absent or empty replay; other models keep the caller's
+// exact history.
+func requiresReasoningReplay(model string) bool {
+	return strings.Contains(strings.ToLower(model), "deepseek")
 }
 
 // firstNonEmpty returns the first candidate that is present and non-empty, or nil

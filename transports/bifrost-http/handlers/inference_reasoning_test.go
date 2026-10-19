@@ -593,3 +593,61 @@ func TestNativeChatIngressReasoningDetailsReachOpenAIWire(t *testing.T) {
 	require.NotContains(t, assistant, "reasoning_details",
 		"reasoning_details is ingress metadata; the provider wire uses reasoning_content")
 }
+
+// TestNativeChatRequestSynthesizesReasoningForToolCalls pins the placeholder
+// that keeps a thinking-mode upstream replayable. That upstream rejects an
+// assistant tool-call turn that replays no reasoning at all, and rejects an
+// empty replay too, so a turn whose real reasoning is unavailable still carries
+// non-empty reasoning. Plain assistant turns, callers that did supply reasoning,
+// and routes that were not measured to enforce the contract stay untouched.
+func TestNativeChatRequestSynthesizesReasoningForToolCalls(t *testing.T) {
+	const toolCall = `{"id":"call_1","type":"function","function":{"name":"ping","arguments":"{}"}}`
+
+	t.Run("deepseek tool-call turn gains a placeholder", func(t *testing.T) {
+		req := nativeChatRequest(t, `{"model":"opencode-go-custom/deepseek-go","messages":[
+			{"role":"user","content":"call ping"},
+			{"role":"assistant","tool_calls":[`+toolCall+`]},
+			{"role":"tool","tool_call_id":"call_1","content":"pong"}]}`)
+
+		assistant := req.Messages[1].ChatAssistantMessage
+		require.NotNil(t, assistant)
+		require.NotNil(t, assistant.Reasoning,
+			"an assistant tool-call turn must replay non-empty reasoning")
+		assert.Equal(t, reasoningReplayPlaceholder, *assistant.Reasoning)
+		require.Len(t, assistant.ToolCalls, 1, "the tool call itself must survive")
+	})
+
+	t.Run("plain assistant turn stays untouched", func(t *testing.T) {
+		req := nativeChatRequest(t, `{"model":"opencode-go-custom/deepseek-go","messages":[
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":"hello"}]}`)
+
+		assistant := req.Messages[1].ChatAssistantMessage
+		if assistant != nil {
+			assert.Nil(t, assistant.Reasoning,
+				"a turn without tool calls does not need a replay")
+		}
+	})
+
+	t.Run("other routes stay untouched", func(t *testing.T) {
+		req := nativeChatRequest(t, `{"model":"opencode-go-custom/glm-go","messages":[
+			{"role":"user","content":"call ping"},
+			{"role":"assistant","tool_calls":[`+toolCall+`]},
+			{"role":"tool","tool_call_id":"call_1","content":"pong"}]}`)
+
+		assistant := req.Messages[1].ChatAssistantMessage
+		require.NotNil(t, assistant)
+		assert.Nil(t, assistant.Reasoning,
+			"only measured DeepSeek routes replay a placeholder")
+	})
+
+	t.Run("caller reasoning is never replaced", func(t *testing.T) {
+		req := nativeChatRequest(t, `{"model":"opencode-go-custom/deepseek-go","messages":[
+			{"role":"assistant","reasoning_content":"real","tool_calls":[`+toolCall+`]}]}`)
+
+		assistant := req.Messages[0].ChatAssistantMessage
+		require.NotNil(t, assistant)
+		require.NotNil(t, assistant.Reasoning)
+		assert.Equal(t, "real", *assistant.Reasoning)
+	})
+}
