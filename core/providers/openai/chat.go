@@ -44,6 +44,12 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 		Provider: bifrostReq.Provider,
 	}
 
+	// The replay placeholder is a wire-level artifact of the DeepSeek-shaped
+	// OpenAI-compatible contract, so it is decided here, while the outbound body
+	// for one serving attempt is built. That is after provider selection
+	// (including a catalog-resolved provider) and once per fallback attempt.
+	applyReasoningReplayPlaceholder(ctx, bifrostReq.Provider, bifrostReq.Model, openaiReq.Messages)
+
 	// Canonical model for capability gating only; wire model (openaiReq.Model) is untouched.
 	capModel := schemas.ResolveCanonicalModel(ctx, bifrostReq.Model)
 	caps := schemas.ResolveModelCaps(bifrostReq.Provider, capModel)
@@ -222,6 +228,44 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 		}
 		openaiReq.filterOpenAISpecificParameters(caps)
 		return openaiReq
+	}
+}
+
+// reasoningReplayPlaceholder is the reasoning text replayed on an assistant
+// tool-call turn whose real reasoning is unavailable. One character, because a
+// thinking-mode upstream treats an empty string as missing.
+const reasoningReplayPlaceholder = "."
+
+// requiresReasoningReplay reports whether the model reaches an upstream that
+// enforces the reasoning replay contract. Only DeepSeek-shaped routes were measured
+// to reject an absent or empty replay; other models keep the caller's exact history.
+func requiresReasoningReplay(model string) bool {
+	return strings.Contains(strings.ToLower(model), "deepseek")
+}
+
+// applyReasoningReplayPlaceholder replays a minimal reasoning text on an assistant
+// tool-call turn that carries none. It runs while the outbound body for one serving
+// attempt is built, which is after provider selection (including a catalog-resolved
+// provider) and once per fallback attempt, because the decision depends on the
+// provider that actually serves the attempt. The native DeepSeek provider turns
+// thinking off for exactly this turn shape and needs the nil reasoning to make that
+// decision, so the field stays absent there; the routes measured to enforce the
+// replay contract (opencode-go's DeepSeek upstream) reject the turn without one.
+// The converted messages are fresh, so the caller's input is never mutated and one
+// attempt's placeholder cannot leak into another.
+func applyReasoningReplayPlaceholder(ctx *schemas.BifrostContext, provider schemas.ModelProvider, model string, messages []OpenAIMessage) {
+	if schemas.ResolveBaseProvider(ctx, provider) == schemas.DeepSeek || !requiresReasoningReplay(model) {
+		return
+	}
+	for i := range messages {
+		assistant := messages[i].OpenAIChatAssistantMessage
+		if assistant == nil || assistant.Reasoning != nil {
+			continue
+		}
+		if messages[i].Role != schemas.ChatMessageRoleAssistant || len(assistant.ToolCalls) == 0 {
+			continue
+		}
+		assistant.Reasoning = schemas.Ptr(reasoningReplayPlaceholder)
 	}
 }
 

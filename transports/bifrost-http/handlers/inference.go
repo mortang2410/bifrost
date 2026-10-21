@@ -582,46 +582,6 @@ func normalizeNativeReasoning(messages []schemas.ChatMessage, raw []nativeRawRea
 	}
 }
 
-// reasoningReplayPlaceholder is the reasoning text replayed on an assistant
-// tool-call turn whose real reasoning is unavailable. One character, because a
-// thinking-mode upstream treats an empty string as missing.
-const reasoningReplayPlaceholder = "."
-
-// requiresReasoningReplay reports whether the request model reaches an upstream
-// that enforces the reasoning replay contract. Only DeepSeek-shaped routes were
-// measured to reject an absent or empty replay; other models keep the caller's
-// exact history. Native DeepSeek is handled separately: it owns a thinking-off
-// guard for this turn shape, so the placeholder must stay off there (see
-// applyReasoningReplayPlaceholder).
-func requiresReasoningReplay(model string) bool {
-	return strings.Contains(strings.ToLower(model), "deepseek")
-}
-
-// applyReasoningReplayPlaceholder replays a minimal reasoning text on an assistant
-// tool-call turn that carries none, but only on the routes measured to enforce the
-// replay contract. It runs after model resolution because provider identity decides
-// whether a placeholder is safe: the native DeepSeek provider turns thinking off
-// for exactly this turn shape (requiresDeepSeekThinkingDisabled in
-// core/providers/deepseek) and needs the nil Reasoning to make that decision.
-// Synthesizing a placeholder there would leave thinking on and replay text the
-// model never produced, which is the shape DeepSeek rejects.
-func applyReasoningReplayPlaceholder(messages []schemas.ChatMessage, provider schemas.ModelProvider, model string) {
-	if provider == schemas.DeepSeek || !requiresReasoningReplay(model) {
-		return
-	}
-	for i := range messages {
-		assistant := messages[i].ChatAssistantMessage
-		if assistant == nil || assistant.Reasoning != nil {
-			continue
-		}
-		if messages[i].Role != schemas.ChatMessageRoleAssistant || len(assistant.ToolCalls) == 0 {
-			continue
-		}
-		placeholder := reasoningReplayPlaceholder
-		assistant.Reasoning = &placeholder
-	}
-}
-
 // firstNonEmpty returns the first candidate that is present and non-empty, or nil
 // when none is. An empty string counts as absent.
 func firstNonEmpty(candidates ...*string) *string {
@@ -1383,12 +1343,6 @@ func prepareChatCompletionRequest(ctx *fasthttp.RequestCtx, config *lib.Config) 
 		}
 	}
 	req.ChatParameters.ExtraParams = base.ExtraParams
-
-	// Provider resolution runs after ChatRequest.UnmarshalJSON, so the
-	// reasoning-replay placeholder is decided here, where the resolved provider is
-	// known. Native DeepSeek must keep nil reasoning so its thinking-off guard can
-	// see the turn shape.
-	applyReasoningReplayPlaceholder(req.Messages, base.Provider, req.Model)
 
 	return req, &schemas.BifrostChatRequest{
 		Provider:  base.Provider,

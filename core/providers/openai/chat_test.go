@@ -3478,3 +3478,129 @@ func BenchmarkOpenAIChatRequestUnknownFields(b *testing.B) {
 		_ = OpenAIChatRequestUnknownFields(body)
 	}
 }
+
+// TestToOpenAIChatRequest_DecidesReasoningReplayPerAttempt pins that the replay
+// placeholder is decided from the serving attempt's provider and model, not at
+// ingress. The native DeepSeek provider owns a thinking-off guard for the turn and
+// must see no reasoning; the measured DeepSeek-shaped OpenAI-compatible route
+// (opencode-go) rejects the turn without a replay. Fallback attempts share the caller's input
+// slice, so the conversion must never mutate it and one attempt's placeholder must
+// not leak into another.
+func TestToOpenAIChatRequest_DecidesReasoningReplayPerAttempt(t *testing.T) {
+	ctx := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+	toolCall := schemas.ChatAssistantMessageToolCall{
+		ID:       schemas.Ptr("call_1"),
+		Function: schemas.ChatAssistantMessageToolCallFunction{Name: schemas.Ptr("ping"), Arguments: `{}`},
+	}
+	input := []schemas.ChatMessage{
+		{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("call ping")}},
+		{
+			Role:                 schemas.ChatMessageRoleAssistant,
+			ChatAssistantMessage: &schemas.ChatAssistantMessage{ToolCalls: []schemas.ChatAssistantMessageToolCall{toolCall}},
+		},
+		{Role: schemas.ChatMessageRoleTool, ChatToolMessage: &schemas.ChatToolMessage{ToolCallID: schemas.Ptr("call_1")}},
+	}
+
+	convert := func(provider schemas.ModelProvider, model string) *OpenAIChatRequest {
+		return ToOpenAIChatRequest(ctx, &schemas.BifrostChatRequest{Provider: provider, Model: model, Input: input})
+	}
+	assistantReasoning := func(t *testing.T, out *OpenAIChatRequest) *string {
+		t.Helper()
+		require.NotNil(t, out)
+		require.Len(t, out.Messages, len(input))
+		require.NotNil(t, out.Messages[1].OpenAIChatAssistantMessage)
+		return out.Messages[1].OpenAIChatAssistantMessage.Reasoning
+	}
+
+	t.Run("bare id resolved to native deepseek keeps the field absent", func(t *testing.T) {
+		// A bare model id has no provider prefix at ingress; the catalog resolver
+		// sets the provider before this builder runs, so this is that post-catalog
+		// shape.
+		out := convert(schemas.DeepSeek, "deepseek-v4.1-flash")
+		assert.Nil(t, assistantReasoning(t, out))
+	})
+
+	t.Run("deepseek-shaped custom attempt gains the placeholder", func(t *testing.T) {
+		out := convert(schemas.ModelProvider("opencode-go-custom"), "deepseek-go")
+		reasoning := assistantReasoning(t, out)
+		require.NotNil(t, reasoning)
+		assert.Equal(t, ".", *reasoning)
+	})
+
+	t.Run("attempts do not leak into each other", func(t *testing.T) {
+		nativeFirst := convert(schemas.DeepSeek, "deepseek-v4.1-flash")
+		customSecond := convert(schemas.ModelProvider("opencode-go-custom"), "deepseek-go")
+		assert.Nil(t, assistantReasoning(t, nativeFirst), "native attempt must stay absent")
+		require.NotNil(t, assistantReasoning(t, customSecond), "fallback attempt must gain the placeholder")
+
+		customFirst := convert(schemas.ModelProvider("opencode-go-custom"), "deepseek-go")
+		nativeSecond := convert(schemas.DeepSeek, "deepseek-v4.1-flash")
+		require.NotNil(t, assistantReasoning(t, customFirst), "primary attempt must gain the placeholder")
+		assert.Nil(t, assistantReasoning(t, nativeSecond), "native fallback must stay absent after a placeholder attempt")
+
+		assert.Nil(t, input[1].ChatAssistantMessage.Reasoning, "the shared caller input must never be mutated")
+	})
+
+	t.Run("caller reasoning is never replaced", func(t *testing.T) {
+		reasoning := "real"
+		out := ToOpenAIChatRequest(ctx, &schemas.BifrostChatRequest{
+			Provider: schemas.ModelProvider("opencode-go-custom"),
+			Model:    "deepseek-go",
+			Input: []schemas.ChatMessage{{
+				Role:                 schemas.ChatMessageRoleAssistant,
+				ChatAssistantMessage: &schemas.ChatAssistantMessage{Reasoning: &reasoning, ToolCalls: []schemas.ChatAssistantMessageToolCall{toolCall}},
+			}},
+		})
+		require.NotNil(t, out)
+		got := out.Messages[0].OpenAIChatAssistantMessage.Reasoning
+		require.NotNil(t, got)
+		assert.Equal(t, "real", *got)
+	})
+
+	t.Run("plain assistant turn stays untouched", func(t *testing.T) {
+		out := ToOpenAIChatRequest(ctx, &schemas.BifrostChatRequest{
+			Provider: schemas.ModelProvider("opencode-go-custom"),
+			Model:    "deepseek-go",
+			Input: []schemas.ChatMessage{{
+				Role:    schemas.ChatMessageRoleAssistant,
+				Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr("hello")},
+			}},
+		})
+		require.NotNil(t, out)
+		require.Len(t, out.Messages, 1)
+		if out.Messages[0].OpenAIChatAssistantMessage != nil {
+			assert.Nil(t, out.Messages[0].OpenAIChatAssistantMessage.Reasoning)
+		}
+	})
+
+	t.Run("non-deepseek model stays untouched", func(t *testing.T) {
+		out := convert(schemas.ModelProvider("opencode-go-custom"), "glm-go")
+		assert.Nil(t, assistantReasoning(t, out))
+	})
+
+	t.Run("custom provider with a deepseek base keeps the field absent", func(t *testing.T) {
+		// Custom providers report their own name; the base type decides whether the
+		// DeepSeek thinking-off guard owns the turn. The guard needs nil Reasoning.
+		baseCtx := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+		baseCtx.SetValue(schemas.BifrostContextKeyBaseProviderType, schemas.DeepSeek)
+		out := ToOpenAIChatRequest(baseCtx, &schemas.BifrostChatRequest{
+			Provider: schemas.ModelProvider("my-custom"),
+			Model:    "deepseek-v4.1-flash",
+			Input:    input,
+		})
+		assert.Nil(t, assistantReasoning(t, out))
+	})
+
+	t.Run("custom provider with an openai base gains the placeholder", func(t *testing.T) {
+		baseCtx := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+		baseCtx.SetValue(schemas.BifrostContextKeyBaseProviderType, schemas.OpenAI)
+		out := ToOpenAIChatRequest(baseCtx, &schemas.BifrostChatRequest{
+			Provider: schemas.ModelProvider("my-openai"),
+			Model:    "deepseek-go",
+			Input:    input,
+		})
+		reasoning := assistantReasoning(t, out)
+		require.NotNil(t, reasoning)
+		assert.Equal(t, ".", *reasoning)
+	})
+}

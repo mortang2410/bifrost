@@ -9,37 +9,20 @@ import (
 	"github.com/bytedance/sonic"
 	"github.com/maximhq/bifrost/core/providers/openai"
 	"github.com/maximhq/bifrost/core/schemas"
-	"github.com/maximhq/bifrost/transports/v2/bifrost-http/lib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/valyala/fasthttp"
 )
 
 // nativeChatRequest decodes a body the way the native POST /v1/chat/completions
 // route's decoder does. prepareRequest[ChatRequest] calls sonic.Unmarshal on the
 // request body, which invokes ChatRequest.UnmarshalJSON, so decoding into
 // ChatRequest here exercises the real ingress decode seam rather than a stand-in
-// for it. Tests that also need provider resolution, or the provider-scoped
-// reasoning-replay placeholder applied after it, use
-// nativeChatRequestThroughHandler.
+// for it.
 func nativeChatRequest(t *testing.T, body string) *ChatRequest {
 	t.Helper()
 	var req ChatRequest
 	require.NoError(t, sonic.Unmarshal([]byte(body), &req))
 	return &req
-}
-
-// nativeChatRequestThroughHandler runs a body through the full native prepare
-// seam, prepareChatCompletionRequest, which decodes the request, resolves model
-// and provider, and applies the reasoning-replay placeholder once the provider is
-// known. This is the seam the placeholder is scoped on.
-func nativeChatRequestThroughHandler(t *testing.T, body string) (*ChatRequest, *schemas.BifrostChatRequest) {
-	t.Helper()
-	ctx := &fasthttp.RequestCtx{}
-	ctx.Request.SetBody([]byte(body))
-	req, bifrostReq, err := prepareChatCompletionRequest(ctx, &lib.Config{})
-	require.NoError(t, err)
-	return req, bifrostReq
 }
 
 // TestNativeChatRequestPromotesReasoningDetailsText covers the native ingress
@@ -612,86 +595,32 @@ func TestNativeChatIngressReasoningDetailsReachOpenAIWire(t *testing.T) {
 		"reasoning_details is ingress metadata; the provider wire uses reasoning_content")
 }
 
-// TestNativeChatRequestSynthesizesReasoningForToolCalls pins the placeholder
-// that keeps a thinking-mode upstream replayable. That upstream rejects an
-// assistant tool-call turn that replays no reasoning at all, and rejects an
-// empty replay too, so a turn whose real reasoning is unavailable still carries
-// non-empty reasoning. The placeholder is scoped by the resolved provider:
-// native DeepSeek owns a thinking-off guard for this turn shape and must keep
-// the nil reasoning, while every other DeepSeek-shaped route keeps the
-// placeholder. Plain assistant turns, callers that did supply reasoning, and
-// routes that were not measured to enforce the contract stay untouched.
-func TestNativeChatRequestSynthesizesReasoningForToolCalls(t *testing.T) {
+// TestNativeChatRequestLeavesToolCallReasoningToTheWire pins that the native
+// ingress never synthesizes reasoning on an assistant tool-call turn. The
+// reasoning-replay placeholder is a wire artifact decided by the OpenAI-compatible
+// request builder (core/providers/openai ToOpenAIChatRequest), which runs once per
+// serving attempt with that attempt's provider and model. The ingress must leave
+// the turn's Reasoning nil so the provider that owns a thinking-off guard
+// (DeepSeek) can see the turn shape, and so a fallback attempt is not forced to
+// inherit the primary attempt's decision.
+func TestNativeChatRequestLeavesToolCallReasoningToTheWire(t *testing.T) {
 	const toolCall = `{"id":"call_1","type":"function","function":{"name":"ping","arguments":"{}"}}`
 
-	// Custom providers are registered at gateway startup, and ParseModelString
-	// only splits a model string on a known provider prefix. Registering it here
-	// makes the test resolve the route the way the running gateway does.
-	schemas.RegisterKnownProvider("opencode-go-custom")
-	t.Cleanup(func() { schemas.UnregisterKnownProvider("opencode-go-custom") })
+	for name, model := range map[string]string{
+		"native deepseek route":        "deepseek/deepseek-v4.1-flash",
+		"deepseek-shaped custom route": "opencode-go-custom/deepseek-go",
+	} {
+		t.Run(name, func(t *testing.T) {
+			req := nativeChatRequest(t, `{"model":"`+model+`","messages":[
+				{"role":"user","content":"call ping"},
+				{"role":"assistant","tool_calls":[`+toolCall+`]},
+				{"role":"tool","tool_call_id":"call_1","content":"pong"}]}`)
 
-	t.Run("deepseek tool-call turn gains a placeholder", func(t *testing.T) {
-		req, bifrostReq := nativeChatRequestThroughHandler(t, `{"model":"opencode-go-custom/deepseek-go","messages":[
-			{"role":"user","content":"call ping"},
-			{"role":"assistant","tool_calls":[`+toolCall+`]},
-			{"role":"tool","tool_call_id":"call_1","content":"pong"}]}`)
-
-		require.Equal(t, schemas.ModelProvider("opencode-go-custom"), bifrostReq.Provider,
-			"the custom provider prefix must resolve before the placeholder is decided")
-		assistant := req.Messages[1].ChatAssistantMessage
-		require.NotNil(t, assistant)
-		require.NotNil(t, assistant.Reasoning,
-			"an assistant tool-call turn must replay non-empty reasoning")
-		assert.Equal(t, reasoningReplayPlaceholder, *assistant.Reasoning)
-		require.Len(t, assistant.ToolCalls, 1, "the tool call itself must survive")
-	})
-
-	t.Run("native deepseek route keeps nil reasoning for its thinking-off guard", func(t *testing.T) {
-		req, bifrostReq := nativeChatRequestThroughHandler(t, `{"model":"deepseek/deepseek-v4.1-flash","messages":[
-			{"role":"user","content":"call ping"},
-			{"role":"assistant","tool_calls":[`+toolCall+`]},
-			{"role":"tool","tool_call_id":"call_1","content":"pong"}]}`)
-
-		require.Equal(t, schemas.DeepSeek, bifrostReq.Provider,
-			"the standard deepseek prefix must resolve to the native provider")
-		assistant := req.Messages[1].ChatAssistantMessage
-		require.NotNil(t, assistant)
-		assert.Nil(t, assistant.Reasoning,
-			"native DeepSeek must keep nil reasoning so requiresDeepSeekThinkingDisabled can force thinking off")
-		require.Len(t, assistant.ToolCalls, 1, "the tool call itself must survive")
-	})
-
-	t.Run("plain assistant turn stays untouched", func(t *testing.T) {
-		req, _ := nativeChatRequestThroughHandler(t, `{"model":"opencode-go-custom/deepseek-go","messages":[
-			{"role":"user","content":"hi"},
-			{"role":"assistant","content":"hello"}]}`)
-
-		assistant := req.Messages[1].ChatAssistantMessage
-		if assistant != nil {
+			assistant := req.Messages[1].ChatAssistantMessage
+			require.NotNil(t, assistant)
 			assert.Nil(t, assistant.Reasoning,
-				"a turn without tool calls does not need a replay")
-		}
-	})
-
-	t.Run("other routes stay untouched", func(t *testing.T) {
-		req, _ := nativeChatRequestThroughHandler(t, `{"model":"opencode-go-custom/glm-go","messages":[
-			{"role":"user","content":"call ping"},
-			{"role":"assistant","tool_calls":[`+toolCall+`]},
-			{"role":"tool","tool_call_id":"call_1","content":"pong"}]}`)
-
-		assistant := req.Messages[1].ChatAssistantMessage
-		require.NotNil(t, assistant)
-		assert.Nil(t, assistant.Reasoning,
-			"only measured DeepSeek routes replay a placeholder")
-	})
-
-	t.Run("caller reasoning is never replaced", func(t *testing.T) {
-		req, _ := nativeChatRequestThroughHandler(t, `{"model":"opencode-go-custom/deepseek-go","messages":[
-			{"role":"assistant","reasoning_content":"real","tool_calls":[`+toolCall+`]}]}`)
-
-		assistant := req.Messages[0].ChatAssistantMessage
-		require.NotNil(t, assistant)
-		require.NotNil(t, assistant.Reasoning)
-		assert.Equal(t, "real", *assistant.Reasoning)
-	})
+				"the ingress must not synthesize reasoning; the request builder decides per attempt")
+			require.Len(t, assistant.ToolCalls, 1, "the tool call itself must survive")
+		})
+	}
 }
