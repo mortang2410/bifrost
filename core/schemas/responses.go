@@ -2093,8 +2093,8 @@ type ResponsesInputMessageContentBlockAudio struct {
 // =============================================================================
 
 type ResponsesOutputMessageContentText struct {
-	Annotations []ResponsesOutputMessageContentTextAnnotation `json:"annotations"`       // Citations and references
-	LogProbs    []ResponsesOutputMessageContentTextLogProb    `json:"logprobs,omitzero"` // Token log probabilities; nil is omitted, [] is kept
+	Annotations []ResponsesOutputMessageContentTextAnnotation `json:"annotations,omitzero"` // Citations and references; nil is omitted, [] is kept
+	LogProbs    []ResponsesOutputMessageContentTextLogProb    `json:"logprobs,omitzero"`    // Token log probabilities; nil is omitted, [] is kept
 }
 
 type ResponsesOutputMessageContentTextAnnotation struct {

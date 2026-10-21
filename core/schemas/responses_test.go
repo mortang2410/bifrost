@@ -2032,6 +2032,38 @@ func TestResponsesOutputTextLogProbsNotNulled(t *testing.T) {
 	assert.Contains(t, string(out), `"logprobs":[]`)
 }
 
+// An output_text history block that omits annotations must not gain "annotations": null
+// on re-marshal. The sibling of TestResponsesOutputTextLogProbsNotNulled: a client that
+// replays logprobs without citations is rejected by strict Responses backends with
+// "Invalid type for 'input[N].content[0].annotations': expected an array of objects, but
+// got null instead", the same class of 400 as the logprobs null.
+func TestResponsesOutputTextAnnotationsNotNulled(t *testing.T) {
+	for _, tc := range []struct {
+		name, in string
+		want     string // raw annotations JSON expected on the wire, "" = absent
+	}{
+		{"logprobs_without_annotations", `{"type":"output_text","text":"Previous answer.","logprobs":[]}`, ""},
+		{"empty_annotations_preserved", `{"type":"output_text","text":"Previous answer.","annotations":[],"logprobs":[]}`, "[]"},
+		{"populated_annotations_preserved", `{"type":"output_text","text":"a","annotations":[{"type":"url_citation","url":"https://example.com","title":"Example","start_index":0,"end_index":1}],"logprobs":[]}`, `[{"type":"url_citation","url":"https://example.com","title":"Example","start_index":0,"end_index":1}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var block ResponsesMessageContentBlock
+			require.NoError(t, Unmarshal([]byte(tc.in), &block))
+			out, err := MarshalSorted(block)
+			require.NoError(t, err)
+			var got map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(out, &got))
+			raw, present := got["annotations"]
+			if tc.want == "" {
+				assert.False(t, present, "annotations must stay absent, got %s", out)
+				return
+			}
+			require.True(t, present, "annotations must be present, got %s", out)
+			assert.JSONEq(t, tc.want, string(raw))
+		})
+	}
+}
+
 // gjsonRaw returns the raw JSON of key, or "" when it is absent.
 func gjsonRaw(payload, key string) string {
 	result := gjson.Get(payload, key)
