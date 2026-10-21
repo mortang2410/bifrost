@@ -2122,10 +2122,10 @@ type ResponsesOutputMessageContentTextAnnotation struct {
 
 // ResponsesOutputMessageContentTextLogProb represents log probability information for content.
 type ResponsesOutputMessageContentTextLogProb struct {
-	Bytes       []int     `json:"bytes"`
+	Bytes       []int     `json:"bytes,omitzero"`
 	LogProb     float64   `json:"logprob"`
 	Token       string    `json:"token"`
-	TopLogProbs []LogProb `json:"top_logprobs"`
+	TopLogProbs []LogProb `json:"top_logprobs,omitzero"`
 }
 type ResponsesOutputMessageContentRefusal struct {
 	Refusal string `json:"refusal"`

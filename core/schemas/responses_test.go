@@ -2032,6 +2032,34 @@ func TestResponsesOutputTextLogProbsNotNulled(t *testing.T) {
 	assert.Contains(t, string(out), `"logprobs":[]`)
 }
 
+// A logprobs entry that omits bytes or top_logprobs must not gain "bytes": null
+// or "top_logprobs": null on re-marshal. The strict Responses validator that
+// rejected a null parent array (kata 5w83) rejects a null one level deeper, so
+// the entry fields carry omitzero too (kata b5aj). An explicitly empty array is
+// preserved, matching the parent fields.
+func TestResponsesOutputTextLogProbsEntryNotNulled(t *testing.T) {
+	for _, tc := range []struct {
+		name, in string
+		want     string // raw logprobs JSON expected on the wire
+	}{
+		{"entry_without_bytes_or_top_logprobs", `{"type":"output_text","text":"a","logprobs":[{"logprob":-0.1,"token":"a"}]}`, `[{"logprob":-0.1,"token":"a"}]`},
+		{"entry_with_bytes_and_top_logprobs", `{"type":"output_text","text":"a","logprobs":[{"bytes":[97],"logprob":-0.1,"token":"a","top_logprobs":[{"token":"a","logprob":-0.1}]}]}`, `[{"bytes":[97],"logprob":-0.1,"token":"a","top_logprobs":[{"token":"a","logprob":-0.1}]}]`},
+		{"entry_with_empty_arrays_preserved", `{"type":"output_text","text":"a","logprobs":[{"bytes":[],"logprob":-0.1,"token":"a","top_logprobs":[]}]}`, `[{"bytes":[],"logprob":-0.1,"token":"a","top_logprobs":[]}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var block ResponsesMessageContentBlock
+			require.NoError(t, Unmarshal([]byte(tc.in), &block))
+			out, err := MarshalSorted(block)
+			require.NoError(t, err)
+			var got map[string]json.RawMessage
+			require.NoError(t, json.Unmarshal(out, &got))
+			raw, present := got["logprobs"]
+			require.True(t, present, "logprobs must be present, got %s", out)
+			assert.JSONEq(t, tc.want, string(raw))
+		})
+	}
+}
+
 // An output_text history block that omits annotations must not gain "annotations": null
 // on re-marshal. The sibling of TestResponsesOutputTextLogProbsNotNulled: a client that
 // replays logprobs without citations is rejected by strict Responses backends with
