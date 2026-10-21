@@ -484,7 +484,7 @@ func (cr *ChatRequest) UnmarshalJSON(data []byte) error {
 	if err := sonic.Unmarshal(data, &rawStruct); err != nil {
 		return err
 	}
-	normalizeNativeReasoning(cr.Model, cr.Messages, rawStruct.Messages)
+	normalizeNativeReasoning(cr.Messages, rawStruct.Messages)
 
 	// Unmarshal ChatParameters (which has its own custom unmarshaller)
 	if cr.ChatParameters == nil {
@@ -531,7 +531,7 @@ type nativeRawReasoning struct {
 // any role, matching the schema decoder and the OpenAI converter; the
 // reasoning_details fallback is assistant-only, because details are what a user,
 // system, or tool turn must never turn into reasoning_content on the wire.
-func normalizeNativeReasoning(model string, messages []schemas.ChatMessage, raw []nativeRawReasoning) {
+func normalizeNativeReasoning(messages []schemas.ChatMessage, raw []nativeRawReasoning) {
 	for i := range messages {
 		if i >= len(raw) {
 			continue
@@ -567,21 +567,6 @@ func normalizeNativeReasoning(model string, messages []schemas.ChatMessage, raw 
 			}
 		}
 
-		// DeepSeek-shaped thinking mode also rejects an assistant tool-call turn
-		// that replays no reasoning at all, and rejects an empty replay too: a
-		// request with the field absent or empty fails with "The `reasoning_content`
-		// in the thinking mode must be passed back to the API", while any non-empty
-		// text passes. The caller may hold no reasoning for such a turn, because the
-		// model produced none or a gateway dropped it, so a minimal placeholder keeps
-		// the turn replayable instead of failing the whole request.
-		if assistant.Reasoning == nil &&
-			messages[i].Role == schemas.ChatMessageRoleAssistant &&
-			len(assistant.ToolCalls) > 0 &&
-			requiresReasoningReplay(model) {
-			placeholder := reasoningReplayPlaceholder
-			assistant.Reasoning = &placeholder
-		}
-
 		// When the caller sent no details array, the decoder synthesized one from
 		// the value it saw before this normalization, which may be the losing
 		// spelling. Rebuild it from the value that actually wins so the replayed
@@ -605,9 +590,36 @@ const reasoningReplayPlaceholder = "."
 // requiresReasoningReplay reports whether the request model reaches an upstream
 // that enforces the reasoning replay contract. Only DeepSeek-shaped routes were
 // measured to reject an absent or empty replay; other models keep the caller's
-// exact history.
+// exact history. Native DeepSeek is handled separately: it owns a thinking-off
+// guard for this turn shape, so the placeholder must stay off there (see
+// applyReasoningReplayPlaceholder).
 func requiresReasoningReplay(model string) bool {
 	return strings.Contains(strings.ToLower(model), "deepseek")
+}
+
+// applyReasoningReplayPlaceholder replays a minimal reasoning text on an assistant
+// tool-call turn that carries none, but only on the routes measured to enforce the
+// replay contract. It runs after model resolution because provider identity decides
+// whether a placeholder is safe: the native DeepSeek provider turns thinking off
+// for exactly this turn shape (requiresDeepSeekThinkingDisabled in
+// core/providers/deepseek) and needs the nil Reasoning to make that decision.
+// Synthesizing a placeholder there would leave thinking on and replay text the
+// model never produced, which is the shape DeepSeek rejects.
+func applyReasoningReplayPlaceholder(messages []schemas.ChatMessage, provider schemas.ModelProvider, model string) {
+	if provider == schemas.DeepSeek || !requiresReasoningReplay(model) {
+		return
+	}
+	for i := range messages {
+		assistant := messages[i].ChatAssistantMessage
+		if assistant == nil || assistant.Reasoning != nil {
+			continue
+		}
+		if messages[i].Role != schemas.ChatMessageRoleAssistant || len(assistant.ToolCalls) == 0 {
+			continue
+		}
+		placeholder := reasoningReplayPlaceholder
+		assistant.Reasoning = &placeholder
+	}
 }
 
 // firstNonEmpty returns the first candidate that is present and non-empty, or nil
@@ -1371,6 +1383,13 @@ func prepareChatCompletionRequest(ctx *fasthttp.RequestCtx, config *lib.Config) 
 		}
 	}
 	req.ChatParameters.ExtraParams = base.ExtraParams
+
+	// Provider resolution runs after ChatRequest.UnmarshalJSON, so the
+	// reasoning-replay placeholder is decided here, where the resolved provider is
+	// known. Native DeepSeek must keep nil reasoning so its thinking-off guard can
+	// see the turn shape.
+	applyReasoningReplayPlaceholder(req.Messages, base.Provider, req.Model)
+
 	return req, &schemas.BifrostChatRequest{
 		Provider:  base.Provider,
 		Model:     base.ModelName,
