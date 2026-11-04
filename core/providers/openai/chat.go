@@ -26,19 +26,35 @@ func (req *OpenAIChatRequest) ToBifrostChatRequest(ctx *schemas.BifrostContext) 
 
 // ToOpenAIChatRequest converts a Bifrost chat completion request to OpenAI format
 func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.BifrostChatRequest) *OpenAIChatRequest {
+	return toOpenAIChatRequest(ctx, bifrostReq, nil)
+}
+
+// toOpenAIChatRequest is ToOpenAIChatRequest with the provider's custom config, which can
+// name the reasoning replay field per model. custom may be nil.
+func toOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.BifrostChatRequest, custom *schemas.CustomProviderConfig) *OpenAIChatRequest {
 	if bifrostReq == nil || bifrostReq.Input == nil {
 		return nil
-	}
-
-	openaiReq := &OpenAIChatRequest{
-		Model:    bifrostReq.Model,
-		Messages: ConvertBifrostMessagesToOpenAIMessages(bifrostReq.Input),
-		Provider: bifrostReq.Provider,
 	}
 
 	// Canonical model for capability gating only; wire model (openaiReq.Model) is untouched.
 	capModel := schemas.ResolveCanonicalModel(ctx, bifrostReq.Model)
 	caps := schemas.ResolveModelCaps(bifrostReq.Provider, capModel)
+
+	// The per-model replay map is keyed by the model id the caller named. Once an alias
+	// resolves, bifrostReq.Model holds the upstream id, and the caller's alias is kept in
+	// the context, so an aliased request looks up that alias. A request that names the
+	// upstream id directly looks up that id.
+	replayModel := bifrostReq.Model
+	if ra := schemas.GetResolvedAlias(ctx); ra != nil && ra.Key != "" {
+		replayModel = ra.Key
+	}
+	field := schemas.ResolveReasoningReplayField(replayModel, custom, caps)
+
+	openaiReq := &OpenAIChatRequest{
+		Model:    bifrostReq.Model,
+		Messages: convertBifrostMessagesToOpenAIMessages(bifrostReq.Input, field),
+		Provider: bifrostReq.Provider,
+	}
 
 	if bifrostReq.Params != nil {
 		openaiReq.ChatParameters = *bifrostReq.Params

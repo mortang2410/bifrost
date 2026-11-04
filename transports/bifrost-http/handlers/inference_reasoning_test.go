@@ -613,15 +613,11 @@ func TestNativeChatIngressReasoningSelectionFixtureIntegrity(t *testing.T) {
 	assertReferenceSelectsNothing(t)
 }
 
-// TestNativeChatIngressDetailsOnlyTurnHasNoWireReasoningYet drives the real native
-// ingress seam and then the provider request conversion, for a turn whose only
-// reasoning spelling was reasoning_details.
-//
-// Interim state: ingress keeps the details structured, and the outbound conversion
-// does not read them yet, so this turn reaches the OpenAI wire with no
-// reasoning_content. The egress ticket that chooses the outbound field must change
-// the first assertion to expect the replayed reasoning text.
-func TestNativeChatIngressDetailsOnlyTurnHasNoWireReasoningYet(t *testing.T) {
+// TestNativeChatIngressDetailsOnlyTurnReachesOpenAIWireAsReasoningContent drives the real
+// native ingress seam and then the provider request conversion, for a turn whose only
+// reasoning spelling was reasoning_details. Under the default setting the details text goes
+// out as reasoning_content, and reasoning_details itself never goes on the wire.
+func TestNativeChatIngressDetailsOnlyTurnReachesOpenAIWireAsReasoningContent(t *testing.T) {
 	req := nativeChatRequest(t, `{"model":"deepseek-v4.1-flash","messages":[{"role":"assistant","reasoning_details":[{"index":0,"type":"reasoning.text","text":"RD-MARK"}],"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}]}`)
 
 	ctx, cancel := schemas.NewBifrostContextWithCancel(nil)
@@ -641,8 +637,8 @@ func TestNativeChatIngressDetailsOnlyTurnHasNoWireReasoningYet(t *testing.T) {
 	require.Len(t, messages, 1)
 	assistant, ok := messages[0].(map[string]any)
 	require.True(t, ok)
-	require.NotContains(t, assistant, "reasoning_content",
-		"interim: a details-only turn carries no reasoning_content until the egress ticket")
+	require.Equal(t, "RD-MARK", assistant["reasoning_content"],
+		"a details-only turn sends its detail text as reasoning_content under the default setting")
 	require.NotContains(t, assistant, "reasoning_details",
 		"reasoning_details is ingress metadata and never goes on the provider wire")
 }

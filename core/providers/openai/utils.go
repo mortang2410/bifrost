@@ -219,8 +219,15 @@ func ConvertOpenAIMessagesToBifrostMessages(messages []OpenAIMessage) []schemas.
 // carrier for. Over-long tool call IDs are stripped of embedded provider
 // reasoning signatures, and tool messages lose is_error so providers that reject
 // unknown message parameters never see it.
+// Assistant reasoning is replayed under the auto setting; see setReplayedReasoning.
 // The caller's messages are never mutated: shared pointers are cloned before edit.
 func ConvertBifrostMessagesToOpenAIMessages(messages []schemas.ChatMessage) []OpenAIMessage {
+	return convertBifrostMessagesToOpenAIMessages(messages, schemas.ReasoningReplayAuto)
+}
+
+// convertBifrostMessagesToOpenAIMessages is ConvertBifrostMessagesToOpenAIMessages with
+// the reasoning replay setting already resolved by the caller.
+func convertBifrostMessagesToOpenAIMessages(messages []schemas.ChatMessage, replayField string) []OpenAIMessage {
 	openaiMessages := make([]OpenAIMessage, len(messages))
 	for i, message := range messages {
 		openaiMessages[i] = OpenAIMessage{
@@ -272,15 +279,90 @@ func ConvertBifrostMessagesToOpenAIMessages(messages []schemas.ChatMessage) []Op
 				}
 				toolCalls = cloned
 			}
-			openaiMessages[i].OpenAIChatAssistantMessage = &OpenAIChatAssistantMessage{
+			assistant := &OpenAIChatAssistantMessage{
 				Refusal:     message.ChatAssistantMessage.Refusal,
-				Reasoning:   message.ChatAssistantMessage.Reasoning,
 				Annotations: message.ChatAssistantMessage.Annotations,
 				ToolCalls:   toolCalls,
 			}
+			setReplayedReasoning(assistant, message.ChatAssistantMessage, message.Role, replayField)
+			openaiMessages[i].OpenAIChatAssistantMessage = assistant
 		}
 	}
 	return openaiMessages
+}
+
+// setReplayedReasoning sets the reasoning field or fields of one outbound assistant
+// message, as the resolved reasoning replay setting names them. Nothing else on out is
+// touched.
+//
+//   - none sends no reasoning.
+//   - reasoning_details sends the caller's details unchanged. A message with no details
+//     falls back to the text rule.
+//   - reasoning, reasoning_content, and reasoning_text send the reasoning text under
+//     that one field.
+//   - auto, and the empty string, send the text under the field the caller's spelling
+//     names, and reasoning_content when the caller used none of the three text
+//     spellings. auto never sends reasoning_details.
+//
+// The text rule takes Reasoning, or when that is empty, the first detail with
+// non-empty text. Empty text is treated as absent and never written. Details are
+// assistant-scoped: a user, system, or tool turn never sends them and never gains
+// reasoning from them. An explicit Reasoning value goes out on any role. The caller's
+// details slice is shared, not copied, and is never written to.
+func setReplayedReasoning(out *OpenAIChatAssistantMessage, msg *schemas.ChatAssistantMessage, role schemas.ChatMessageRole, replayField string) {
+	if replayField == schemas.ReasoningReplayNone {
+		return
+	}
+	if replayField == schemas.ReasoningReplayReasoningDetails && role == schemas.ChatMessageRoleAssistant && len(msg.ReasoningDetails) > 0 {
+		out.ReasoningDetails = msg.ReasoningDetails
+		return
+	}
+	text := replayedReasoningText(role, msg)
+	if text == "" {
+		return
+	}
+	switch replayTextField(replayField, msg.ReasoningSource) {
+	case schemas.ReasoningReplayReasoning:
+		out.ReasoningAlias = &text
+	case schemas.ReasoningReplayReasoningText:
+		out.ReasoningText = &text
+	default:
+		out.Reasoning = &text
+	}
+}
+
+// replayTextField names the text field that carries a message's reasoning text. A fixed
+// text setting wins. Otherwise the caller's spelling decides, and any spelling other
+// than reasoning or reasoning_text (reasoning_content, an empty spelling, or
+// reasoning_details) maps to reasoning_content.
+func replayTextField(replayField, source string) string {
+	switch replayField {
+	case schemas.ReasoningReplayReasoning, schemas.ReasoningReplayReasoningContent, schemas.ReasoningReplayReasoningText:
+		return replayField
+	}
+	switch source {
+	case schemas.ReasoningReplayReasoning, schemas.ReasoningReplayReasoningText:
+		return source
+	}
+	return schemas.ReasoningReplayReasoningContent
+}
+
+// replayedReasoningText returns Reasoning when it is non-empty. Otherwise, on an assistant
+// turn only, it returns the text of the first reasoning detail whose text is non-empty. A
+// detail that holds only a signature supplies no text.
+func replayedReasoningText(role schemas.ChatMessageRole, msg *schemas.ChatAssistantMessage) string {
+	if msg.Reasoning != nil && *msg.Reasoning != "" {
+		return *msg.Reasoning
+	}
+	if role != schemas.ChatMessageRoleAssistant {
+		return ""
+	}
+	for _, detail := range msg.ReasoningDetails {
+		if detail.Text != nil && *detail.Text != "" {
+			return *detail.Text
+		}
+	}
+	return ""
 }
 
 // MaxUserFieldLength for OpenAI enforces a 64 character maximum on the user field
