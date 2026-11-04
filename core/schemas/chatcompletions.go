@@ -1575,6 +1575,11 @@ type ChatAssistantMessage struct {
 	ReasoningDetails []ChatReasoningDetails           `json:"reasoning_details,omitempty"`
 	Annotations      []ChatAssistantMessageAnnotation `json:"annotations,omitempty"`
 	ToolCalls        []ChatAssistantMessageToolCall   `json:"tool_calls,omitempty"`
+	// ReasoningDetailsSynthesized is true when Bifrost built ReasoningDetails from Reasoning
+	// text, in UnmarshalJSON or in native request ingress, and the payload carried no
+	// structured details. Outbound replay sends the text rather than those synthesized
+	// details under the reasoning_details setting. Never serialized.
+	ReasoningDetailsSynthesized bool `json:"-"`
 }
 
 // MarshalJSON emits reasoning under both spellings the ecosystem uses.
@@ -1619,7 +1624,9 @@ func (cm ChatAssistantMessage) MarshalJSON() ([]byte, error) {
 // (xAI and DeepSeek), and reasoning_text. The first non-empty one wins, in that
 // order, and ReasoningSource records which one won.
 // If Reasoning is non-nil and ReasoningDetails is nil/empty, it adds a single
-// ChatReasoningDetails entry of type "reasoning.text" with the text set to Reasoning.
+// ChatReasoningDetails entry of type "reasoning.text" with the text set to Reasoning,
+// and sets ReasoningDetailsSynthesized so replay can tell that entry from details the
+// payload carried.
 //
 // This type is both the request and the response shape, so it deliberately does
 // NOT promote reasoning_details text into Reasoning. Doing so here would rewrite
@@ -1677,6 +1684,7 @@ func (cm *ChatAssistantMessage) UnmarshalJSON(data []byte) error {
 				Text:  &text,
 			},
 		}
+		cm.ReasoningDetailsSynthesized = true
 	}
 
 	return nil

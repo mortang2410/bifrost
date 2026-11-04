@@ -616,7 +616,8 @@ func TestNativeChatIngressReasoningSelectionFixtureIntegrity(t *testing.T) {
 // TestNativeChatIngressDetailsOnlyTurnReachesOpenAIWireAsReasoningContent drives the real
 // native ingress seam and then the provider request conversion, for a turn whose only
 // reasoning spelling was reasoning_details. Under the default setting the details text goes
-// out as reasoning_content, and reasoning_details itself never goes on the wire.
+// out as reasoning_content, and reasoning_details itself is not sent. It is sent only when
+// the model's replay setting names reasoning_details.
 func TestNativeChatIngressDetailsOnlyTurnReachesOpenAIWireAsReasoningContent(t *testing.T) {
 	req := nativeChatRequest(t, `{"model":"deepseek-v4.1-flash","messages":[{"role":"assistant","reasoning_details":[{"index":0,"type":"reasoning.text","text":"RD-MARK"}],"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}]}`)
 
@@ -640,7 +641,75 @@ func TestNativeChatIngressDetailsOnlyTurnReachesOpenAIWireAsReasoningContent(t *
 	require.Equal(t, "RD-MARK", assistant["reasoning_content"],
 		"a details-only turn sends its detail text as reasoning_content under the default setting")
 	require.NotContains(t, assistant, "reasoning_details",
-		"reasoning_details is ingress metadata and never goes on the provider wire")
+		"under the default setting reasoning_details is not sent on the provider wire; it is sent only when the model's replay setting names reasoning_details")
+}
+
+// nativeWireAssistant runs a native chat body through the native ingress decode, then the
+// OpenAI request conversion under the replay field configured for the model. It returns the
+// first assistant message as the wire carries it, each key as its raw JSON.
+func nativeWireAssistant(t *testing.T, body, model, replayField string) map[string]json.RawMessage {
+	t.Helper()
+	req := nativeChatRequest(t, body)
+	ctx, cancel := schemas.NewBifrostContextWithCancel(nil)
+	defer cancel()
+	bifrostReq := &schemas.BifrostChatRequest{
+		Provider: schemas.OpenAI,
+		Model:    model,
+		Input:    req.Messages,
+	}
+	custom := &schemas.CustomProviderConfig{ReasoningReplayFields: map[string]string{model: replayField}}
+	wireBody, err := sonic.Marshal(openai.ToOpenAIChatRequestForProvider(ctx, bifrostReq, custom))
+	require.NoError(t, err)
+
+	var wire struct {
+		Messages []map[string]json.RawMessage `json:"messages"`
+	}
+	require.NoError(t, json.Unmarshal(wireBody, &wire))
+	require.NotEmpty(t, wire.Messages)
+	return wire.Messages[0]
+}
+
+// TestNativeChatIngressDetailsModeTextOnlyTurnFallsBackToText covers a caller that replays
+// assistant reasoning as text only, under a model configured to replay reasoning_details.
+// Native ingress must not turn that text into a details array for the wire. The text goes
+// out under the caller's own spelling instead.
+func TestNativeChatIngressDetailsModeTextOnlyTurnFallsBackToText(t *testing.T) {
+	const model = "deepseek-v4.1-flash"
+	const tool = `"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]`
+	for _, spelling := range []string{"reasoning", "reasoning_content"} {
+		t.Run(spelling, func(t *testing.T) {
+			body := `{"model":"` + model + `","messages":[{"role":"assistant","` + spelling + `":"TEXT-T",` + tool + `}]}`
+			assistant := nativeWireAssistant(t, body, model, schemas.ReasoningReplayReasoningDetails)
+			require.NotContains(t, assistant, "reasoning_details",
+				"a text-only turn must not send a details array that Bifrost built from its text")
+			require.Equal(t, `"TEXT-T"`, string(assistant[spelling]),
+				"the text must go out under the caller's own spelling")
+		})
+	}
+}
+
+// TestNativeChatIngressDetailsModeForwardsCallerDetails covers a caller that sent
+// reasoning_details itself, under a model configured to replay reasoning_details. The
+// details reach the wire as the caller sent them, with or without text alongside.
+func TestNativeChatIngressDetailsModeForwardsCallerDetails(t *testing.T) {
+	const model = "deepseek-v4.1-flash"
+	const details = `[{"index":0,"type":"reasoning.text","text":"RD-MARK","signature":"sig-marker"}]`
+	const tool = `"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]`
+	cases := []struct {
+		name string
+		msg  string
+	}{
+		{"details only", `{"role":"assistant","reasoning_details":` + details + `,` + tool + `}`},
+		{"details with text", `{"role":"assistant","reasoning":"R-MARK","reasoning_details":` + details + `,` + tool + `}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"model":"` + model + `","messages":[` + tc.msg + `]}`
+			assistant := nativeWireAssistant(t, body, model, schemas.ReasoningReplayReasoningDetails)
+			require.Equal(t, details, string(assistant["reasoning_details"]),
+				"the caller's details must reach the wire byte for byte")
+		})
+	}
 }
 
 // TestNativeChatRequestSynthesizesReasoningForToolCalls pins the placeholder

@@ -561,7 +561,8 @@ func normalizeNativeReasoning(model string, messages []schemas.ChatMessage, raw 
 		// When the caller sent no details array, the decoder synthesized one from
 		// the value it saw before this normalization, which may be the losing
 		// spelling. Rebuild it from the value that actually wins so the replayed
-		// reasoning and its details cannot disagree.
+		// reasoning and its details cannot disagree. The rebuilt entry is marked
+		// synthesized, so outbound replay sends the text instead of these details.
 		if len(raw[i].ReasoningDetails) == 0 && assistant.Reasoning != nil {
 			text := *assistant.Reasoning
 			assistant.ReasoningDetails = []schemas.ChatReasoningDetails{{
@@ -569,6 +570,7 @@ func normalizeNativeReasoning(model string, messages []schemas.ChatMessage, raw 
 				Type:  schemas.BifrostReasoningDetailsTypeText,
 				Text:  &text,
 			}}
+			assistant.ReasoningDetailsSynthesized = true
 		}
 	}
 }

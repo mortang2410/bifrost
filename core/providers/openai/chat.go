@@ -29,6 +29,14 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 	return toOpenAIChatRequest(ctx, bifrostReq, nil)
 }
 
+// ToOpenAIChatRequestForProvider is ToOpenAIChatRequest under a provider's custom config,
+// which can name the reasoning replay field per model. It runs the same conversion the
+// provider's own request path runs, so a caller outside this package can check the wire
+// body a configured replay field produces.
+func ToOpenAIChatRequestForProvider(ctx *schemas.BifrostContext, bifrostReq *schemas.BifrostChatRequest, custom *schemas.CustomProviderConfig) *OpenAIChatRequest {
+	return toOpenAIChatRequest(ctx, bifrostReq, custom)
+}
+
 // toOpenAIChatRequest is ToOpenAIChatRequest with the provider's custom config, which can
 // name the reasoning replay field per model. custom may be nil.
 func toOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.BifrostChatRequest, custom *schemas.CustomProviderConfig) *OpenAIChatRequest {

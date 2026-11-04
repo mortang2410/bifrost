@@ -296,8 +296,8 @@ func convertBifrostMessagesToOpenAIMessages(messages []schemas.ChatMessage, repl
 // touched.
 //
 //   - none sends no reasoning.
-//   - reasoning_details sends the caller's details unchanged. A message with no details
-//     falls back to the text rule.
+//   - reasoning_details sends the message's details unchanged. A message with no details, or
+//     whose details Bifrost synthesized from its reasoning text, falls back to the text rule.
 //   - reasoning, reasoning_content, and reasoning_text send the reasoning text under
 //     that one field.
 //   - auto, and the empty string, send the text under the field the caller's spelling
@@ -313,7 +313,8 @@ func setReplayedReasoning(out *OpenAIChatAssistantMessage, msg *schemas.ChatAssi
 	if replayField == schemas.ReasoningReplayNone {
 		return
 	}
-	if replayField == schemas.ReasoningReplayReasoningDetails && role == schemas.ChatMessageRoleAssistant && len(msg.ReasoningDetails) > 0 {
+	if replayField == schemas.ReasoningReplayReasoningDetails && role == schemas.ChatMessageRoleAssistant &&
+		len(msg.ReasoningDetails) > 0 && !msg.ReasoningDetailsSynthesized {
 		out.ReasoningDetails = msg.ReasoningDetails
 		return
 	}

@@ -299,7 +299,7 @@ func TestChatCompletion_OpenAIEndpointKeepsThinkingForToolCallWithReasoningDetai
 	})
 
 	// The premise: the detail text goes out as reasoning_content on the tool-call turn,
-	// and reasoning_details itself never goes on the wire.
+	// and, under the default setting, reasoning_details itself is not sent on the wire.
 	toolCallMsg := assistantMessageAt(t, captured, 1)
 	if got, ok := toolCallMsg["reasoning_content"].(string); !ok || got != reasoning {
 		t.Fatalf("reasoning_details text must reach the wire as reasoning_content, got %#v", toolCallMsg["reasoning_content"])
