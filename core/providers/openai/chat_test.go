@@ -1950,6 +1950,7 @@ func TestConvertOpenAIMessagesToBifrostMessages_NormalizesReasoningSpellings(t *
 		{name: "reasoning_content", payload: `{"role":"assistant","reasoning_content":"step by step"}`},
 		{name: "reasoning", payload: `{"role":"assistant","reasoning":"step by step"}`},
 		{name: "reasoning_details", payload: `{"role":"assistant","reasoning_details":[{"index":0,"type":"reasoning.text","text":"step by step"}]}`},
+		{name: "reasoning_text", payload: `{"role":"assistant","reasoning_text":"step by step"}`},
 	}
 
 	for _, tt := range tests {
@@ -1965,6 +1966,92 @@ func TestConvertOpenAIMessagesToBifrostMessages_NormalizesReasoningSpellings(t *
 			require.Equal(t, reasoning, *converted[0].ChatAssistantMessage.Reasoning)
 		})
 	}
+}
+
+// The converter records which spelling produced Reasoning. The source travels with
+// the text, so a later choice of outbound field can tell an explicit spelling from
+// the reasoning_details fallback.
+func TestConvertOpenAIMessagesToBifrostMessages_ReasoningSource(t *testing.T) {
+	tests := []struct {
+		name       string
+		payload    string
+		wantText   *string
+		wantSource string
+	}{
+		{
+			name:       "reasoning_content",
+			payload:    `{"role":"assistant","reasoning_content":"RC"}`,
+			wantText:   expectStr("RC"),
+			wantSource: "reasoning_content",
+		},
+		{
+			name:       "reasoning",
+			payload:    `{"role":"assistant","reasoning":"R"}`,
+			wantText:   expectStr("R"),
+			wantSource: "reasoning",
+		},
+		{
+			name:       "reasoning_text",
+			payload:    `{"role":"assistant","reasoning_text":"RT"}`,
+			wantText:   expectStr("RT"),
+			wantSource: "reasoning_text",
+		},
+		{
+			name:       "empty reasoning_content falls through to reasoning_text",
+			payload:    `{"role":"assistant","reasoning_content":"","reasoning_text":"RT"}`,
+			wantText:   expectStr("RT"),
+			wantSource: "reasoning_text",
+		},
+		{
+			name:       "details fallback on an assistant turn",
+			payload:    `{"role":"assistant","reasoning_details":[{"index":0,"type":"reasoning.text","text":"D"}]}`,
+			wantText:   expectStr("D"),
+			wantSource: "reasoning_details",
+		},
+		{
+			name:       "details on a user turn are not folded",
+			payload:    `{"role":"user","reasoning_details":[{"index":0,"type":"reasoning.text","text":"D"}]}`,
+			wantText:   nil,
+			wantSource: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var msg OpenAIMessage
+			require.NoError(t, sonic.Unmarshal([]byte(tt.payload), &msg))
+
+			converted := ConvertOpenAIMessagesToBifrostMessages([]OpenAIMessage{msg})
+			require.Len(t, converted, 1)
+			require.NotNil(t, converted[0].ChatAssistantMessage)
+			assert.Equal(t, tt.wantText, converted[0].ChatAssistantMessage.Reasoning)
+			assert.Equal(t, tt.wantSource, converted[0].ChatAssistantMessage.ReasoningSource)
+		})
+	}
+}
+
+// When all four spellings arrive together, reasoning_content wins and the source
+// says so. The caller's reasoning_details pass through unchanged, so the details
+// text "D" is not replaced by the winning text "RC".
+func TestConvertOpenAIMessagesToBifrostMessages_AllFourSpellingsPrecedence(t *testing.T) {
+	payload := `{"role":"assistant","reasoning_content":"RC","reasoning":"R","reasoning_text":"RT","reasoning_details":[{"index":0,"type":"reasoning.text","text":"D","signature":"sig"}]}`
+
+	var msg OpenAIMessage
+	require.NoError(t, sonic.Unmarshal([]byte(payload), &msg))
+
+	converted := ConvertOpenAIMessagesToBifrostMessages([]OpenAIMessage{msg})
+	require.Len(t, converted, 1)
+	assistant := converted[0].ChatAssistantMessage
+	require.NotNil(t, assistant)
+	require.NotNil(t, assistant.Reasoning)
+	assert.Equal(t, "RC", *assistant.Reasoning)
+	assert.Equal(t, "reasoning_content", assistant.ReasoningSource)
+	assertReasoningDetails(t, []reasoningDetailExpect{{
+		index:     0,
+		typ:       schemas.BifrostReasoningDetailsTypeText,
+		text:      expectStr("D"),
+		signature: expectStr("sig"),
+	}}, assistant.ReasoningDetails, "all four spellings")
 }
 
 // reasoningDetailExpect describes one reasoning_details entry exactly as the
@@ -2061,6 +2148,7 @@ type parsedFixtureInput struct {
 	Role             *string         `json:"role"`
 	Reasoning        *string         `json:"reasoning"`
 	ReasoningContent *string         `json:"reasoning_content"`
+	ReasoningText    *string         `json:"reasoning_text"`
 	ReasoningDetails json.RawMessage `json:"reasoning_details"`
 }
 
@@ -2100,9 +2188,10 @@ func referenceFirstNonEmpty(candidates ...*string) *string {
 }
 
 // referenceSelect implements the documented selection rule independently of the
-// production code: first non-empty of reasoning_content then reasoning, then, on
-// an assistant turn only, the first non-empty detail text. An empty explicit
-// value counts as absent. The caller's details are returned unchanged.
+// production code: first non-empty of reasoning_content, reasoning, then
+// reasoning_text, then, on an assistant turn only, the first non-empty detail
+// text. An empty explicit value counts as absent. The caller's details are
+// returned unchanged.
 func referenceSelect(t *testing.T, raw string) referenceSelection {
 	t.Helper()
 	var in parsedFixtureInput
@@ -2130,7 +2219,7 @@ func referenceSelect(t *testing.T, raw string) referenceSelection {
 		}
 	}
 
-	ref.selection = referenceFirstNonEmpty(in.ReasoningContent, in.Reasoning)
+	ref.selection = referenceFirstNonEmpty(in.ReasoningContent, in.Reasoning, in.ReasoningText)
 	if ref.selection == nil && in.Role != nil && *in.Role == string(schemas.ChatMessageRoleAssistant) {
 		for _, d := range ref.callerDetails {
 			if d.text != nil && *d.text != "" {
@@ -2322,12 +2411,14 @@ func assertReferenceSelectsNothing(t *testing.T) {
 }
 
 // TestOpenAIConverterReasoningSelection pins the integration-mount selection rule
-// across the same case table as the native-ingress half in
-// transports/bifrost-http/handlers (TestNativeChatIngressReasoningSelection): the
-// first non-empty reasoning text wins, an empty explicit value counts as absent,
-// and an explicit non-empty value beats the details. Both read the same fixture,
-// so a client must not get different replayed reasoning depending on which
-// endpoint spelling it used.
+// across the same case table that TestNativeChatIngressReasoningSelection in
+// transports/bifrost-http/handlers reads. The explicit spellings resolve in the
+// order reasoning_content, reasoning, reasoning_text: the first non-empty one
+// wins, and an empty explicit value counts as absent. An explicit value beats the
+// details. On an assistant turn with no explicit text, the first non-empty
+// reasoning_details text is the fallback. The native request path does not take
+// that fallback, so the two paths differ on details-only assistant turns on
+// purpose. This test covers the converter side only.
 //
 // The expectation is computed by referenceSelect from the input alone, so it is
 // the documented rule rather than a stored value, and each row asserts the whole

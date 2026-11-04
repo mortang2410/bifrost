@@ -135,11 +135,12 @@ func TestReasoningContentAliasIsEmittedOnOutput(t *testing.T) {
 }
 
 // ChatAssistantMessage is both the request and the response shape: it is what
-// provider responses decode into, via BifrostResponseChoice. The native request
-// path promotes reasoning_details text onto Reasoning in the handlers package,
-// and that promotion must not leak into this shared decoder, or every provider
-// response carrying only reasoning_details would be rewritten as it arrives and
-// clients would suddenly see an extra reasoning/reasoning_content key.
+// provider responses decode into, via BifrostResponseChoice. This decoder must
+// never promote reasoning_details text onto Reasoning. If it did, every provider
+// response carrying only reasoning_details would be rewritten as it arrives, and
+// clients would suddenly see an extra reasoning/reasoning_content key. The native
+// request path also leaves reasoning_details structured, and the OpenAI-wire
+// converter applies its own assistant-only fallback instead.
 func TestAssistantReasoningDetailsOnlyResponseIsNotRewritten(t *testing.T) {
 	raw := `{"role":"assistant","content":"answer","reasoning_details":[{"index":0,"type":"reasoning.text","text":"RESP-MARK","signature":"sig-marker"}]}`
 

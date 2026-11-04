@@ -24,24 +24,24 @@ func nativeChatRequest(t *testing.T, body string) *ChatRequest {
 	return &req
 }
 
-// TestNativeChatRequestPromotesReasoningDetailsText covers the native ingress
-// path, which decodes messages straight into the Bifrost schema instead of going
-// through the OpenAI integration converter. A caller that replays its assistant
-// reasoning only as reasoning_details must still reach provider request
-// conversion with Reasoning set, because DeepSeek-shaped upstreams reject an
-// assistant tool-call turn that carries no reasoning_content.
-func TestNativeChatRequestPromotesReasoningDetailsText(t *testing.T) {
+// TestNativeChatRequestKeepsReasoningDetailsStructured covers the native ingress
+// path for a caller that replays its assistant reasoning only as reasoning_details.
+// Details stay structured: their text is not copied onto Reasoning, and their
+// signature, summary, and data survive unchanged. No explicit spelling was sent,
+// so no source is recorded.
+func TestNativeChatRequestKeepsReasoningDetailsStructured(t *testing.T) {
 	const reasoning = "RD-MARK"
 	req := nativeChatRequest(t, `{"model":"deepseek-v4.1-flash","messages":[{"role":"assistant","reasoning_details":[{"index":0,"type":"reasoning.text","text":"RD-MARK","summary":"summary marker","signature":"sig marker","data":"data marker"}],"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}]}`)
 
 	require.Len(t, req.Messages, 1)
 	assistant := req.Messages[0].ChatAssistantMessage
 	require.NotNil(t, assistant)
-	require.NotNil(t, assistant.Reasoning,
-		"native ingress must normalize reasoning_details text for provider replay")
-	assert.Equal(t, reasoning, *assistant.Reasoning)
+	assert.Nil(t, assistant.Reasoning,
+		"native ingress must not copy reasoning_details text onto Reasoning")
+	assert.Empty(t, assistant.ReasoningSource,
+		"with no explicit spelling there is no source to record")
 	require.Len(t, assistant.ReasoningDetails, 1,
-		"promoting text must preserve the original reasoning detail")
+		"the caller's reasoning detail must survive native ingress")
 	require.NotNil(t, assistant.ReasoningDetails[0].Text)
 	require.NotNil(t, assistant.ReasoningDetails[0].Summary)
 	require.NotNil(t, assistant.ReasoningDetails[0].Signature)
@@ -53,11 +53,11 @@ func TestNativeChatRequestPromotesReasoningDetailsText(t *testing.T) {
 	require.Len(t, assistant.ToolCalls, 1, "tool-call history must survive native ingress")
 }
 
-// TestNativeChatRequestOnlyPromotesAssistantReasoning pins the role gate.
-// Reasoning is an assistant-only concept, so a user, system, or tool turn must
-// never gain it; otherwise the message reaches the provider with a
-// reasoning_content key its schema has no field for.
-func TestNativeChatRequestOnlyPromotesAssistantReasoning(t *testing.T) {
+// TestNativeChatRequestDetailsNeverBecomeReasoning pins that reasoning_details on
+// a user, system, or tool turn never reaches the provider as reasoning_content,
+// a key that role has no field for. Native ingress copies no detail text onto
+// Reasoning on any role.
+func TestNativeChatRequestDetailsNeverBecomeReasoning(t *testing.T) {
 	cases := map[string]string{
 		"user":   `{"model":"m","messages":[{"role":"user","reasoning_details":[{"index":0,"type":"reasoning.text","text":"USER-MARK"}]}]}`,
 		"system": `{"model":"m","messages":[{"role":"system","reasoning_details":[{"index":0,"type":"reasoning.text","text":"SYS-MARK"}]}]}`,
@@ -70,7 +70,7 @@ func TestNativeChatRequestOnlyPromotesAssistantReasoning(t *testing.T) {
 			assistant := req.Messages[0].ChatAssistantMessage
 			require.NotNil(t, assistant, "the reasoning_details entry must still be parsed")
 			assert.Nil(t, assistant.Reasoning,
-				"a %s turn must not have reasoning_details text promoted onto Reasoning", role)
+				"a %s turn must not have reasoning_details text copied onto Reasoning", role)
 
 			ctx, cancel := schemas.NewBifrostContextWithCancel(nil)
 			defer cancel()
@@ -122,6 +122,55 @@ func TestNativeChatRequestKeepsExplicitReasoningForAnyRole(t *testing.T) {
 				"native ingress must keep the caller's explicit reasoning value verbatim")
 		})
 	}
+}
+
+// TestNativeChatRequestReasoningSpellingPrecedence pins the native explicit-spelling
+// order: reasoning_content, then reasoning, then reasoning_text, where an empty
+// value counts as absent. ReasoningSource records the spelling that won.
+func TestNativeChatRequestReasoningSpellingPrecedence(t *testing.T) {
+	cases := map[string]struct {
+		fields     string
+		wantText   string
+		wantSource string
+	}{
+		"reasoning_text alone":                            {fields: `"reasoning_text":"RT-MARK"`, wantText: "RT-MARK", wantSource: "reasoning_text"},
+		"reasoning_content alone":                         {fields: `"reasoning_content":"RC-MARK"`, wantText: "RC-MARK", wantSource: "reasoning_content"},
+		"reasoning alone":                                 {fields: `"reasoning":"R-MARK"`, wantText: "R-MARK", wantSource: "reasoning"},
+		"reasoning beats reasoning_text":                  {fields: `"reasoning":"R-MARK","reasoning_text":"RT-MARK"`, wantText: "R-MARK", wantSource: "reasoning"},
+		"reasoning_content beats reasoning and text":      {fields: `"reasoning_content":"RC-MARK","reasoning":"R-MARK","reasoning_text":"RT-MARK"`, wantText: "RC-MARK", wantSource: "reasoning_content"},
+		"empty reasoning_content falls to reasoning_text": {fields: `"reasoning_content":"","reasoning_text":"RT-MARK"`, wantText: "RT-MARK", wantSource: "reasoning_text"},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			req := nativeChatRequest(t, `{"model":"m","messages":[{"role":"assistant",`+tc.fields+`}]}`)
+			require.Len(t, req.Messages, 1)
+			assistant := req.Messages[0].ChatAssistantMessage
+			require.NotNil(t, assistant)
+			require.NotNil(t, assistant.Reasoning)
+			assert.Equal(t, tc.wantText, *assistant.Reasoning)
+			assert.Equal(t, tc.wantSource, assistant.ReasoningSource)
+		})
+	}
+}
+
+// TestNativeChatRequestAllFourSpellingsKeepDetails pins that when every spelling
+// arrives together, the explicit winner is selected and the caller's
+// reasoning_details survive unchanged.
+func TestNativeChatRequestAllFourSpellingsKeepDetails(t *testing.T) {
+	req := nativeChatRequest(t, `{"model":"m","messages":[{"role":"assistant","reasoning_content":"RC-MARK","reasoning":"R-MARK","reasoning_text":"RT-MARK","reasoning_details":[{"index":0,"type":"reasoning.text","text":"DETAIL-MARK","signature":"sig-marker"}]}]}`)
+
+	require.Len(t, req.Messages, 1)
+	assistant := req.Messages[0].ChatAssistantMessage
+	require.NotNil(t, assistant)
+	require.NotNil(t, assistant.Reasoning)
+	assert.Equal(t, "RC-MARK", *assistant.Reasoning)
+	assert.Equal(t, "reasoning_content", assistant.ReasoningSource)
+	assertReasoningDetails(t, []reasoningDetailExpect{{
+		index:     0,
+		typ:       schemas.BifrostReasoningDetailsTypeText,
+		text:      expectStr("DETAIL-MARK"),
+		signature: expectStr("sig-marker"),
+	}}, assistant.ReasoningDetails, "all four spellings")
 }
 
 // reasoningDetailExpect describes one reasoning_details entry exactly as the
@@ -206,9 +255,15 @@ var reasoningSelectionCaseNames = []string{
 }
 
 // reasoningSelectionSelectsNothing names the rows whose input must select no
-// reasoning. It is checked against the reference rule's own verdict, so a
-// fixture edit that makes such a row start selecting fails.
+// reasoning on the native path. Detail text is not selected here, so every row
+// whose only text sits in reasoning_details is in this list. It is checked
+// against the reference rule's own verdict, so a fixture edit that makes such a
+// row start selecting fails.
 var reasoningSelectionSelectsNothing = []string{
+	"details only",
+	"empty first detail then text",
+	"empty reasoning_content then detail text",
+	"empty reasoning then detail text",
 	"signature-only detail with no text",
 	"both explicit empty",
 }
@@ -218,6 +273,7 @@ type parsedFixtureInput struct {
 	Role             *string         `json:"role"`
 	Reasoning        *string         `json:"reasoning"`
 	ReasoningContent *string         `json:"reasoning_content"`
+	ReasoningText    *string         `json:"reasoning_text"`
 	ReasoningDetails json.RawMessage `json:"reasoning_details"`
 }
 
@@ -256,10 +312,11 @@ func referenceFirstNonEmpty(candidates ...*string) *string {
 	return nil
 }
 
-// referenceSelect implements the documented selection rule independently of the
-// production code: first non-empty of reasoning_content then reasoning, then, on
-// an assistant turn only, the first non-empty detail text. An empty explicit
-// value counts as absent. The caller's details are returned unchanged.
+// referenceSelect implements the documented native selection rule independently of
+// the production code: first non-empty of reasoning_content, reasoning, then
+// reasoning_text. Detail text is never selected on this path; details stay
+// structured. An empty explicit value counts as absent. The caller's details are
+// returned unchanged.
 func referenceSelect(t *testing.T, raw string) referenceSelection {
 	t.Helper()
 	var in parsedFixtureInput
@@ -287,16 +344,7 @@ func referenceSelect(t *testing.T, raw string) referenceSelection {
 		}
 	}
 
-	ref.selection = referenceFirstNonEmpty(in.ReasoningContent, in.Reasoning)
-	if ref.selection == nil && in.Role != nil && *in.Role == string(schemas.ChatMessageRoleAssistant) {
-		for _, d := range ref.callerDetails {
-			if d.text != nil && *d.text != "" {
-				text := *d.text
-				ref.selection = &text
-				break
-			}
-		}
-	}
+	ref.selection = referenceFirstNonEmpty(in.ReasoningContent, in.Reasoning, in.ReasoningText)
 	return ref
 }
 
@@ -479,11 +527,13 @@ func assertReferenceSelectsNothing(t *testing.T) {
 }
 
 // TestNativeChatIngressReasoningSelection is the native-ingress half of a pair of
-// tests that pin one selection rule: the first non-empty reasoning text wins, and
-// an empty explicit value counts as absent. The integration-mount half lives in
-// core/providers/openai (TestOpenAIConverterReasoningSelection) because the
-// transports module resolves its core dependency from the module cache in a plain
-// module build. Both read the same fixture.
+// tests that pin the explicit-spelling rule: the first non-empty of
+// reasoning_content, reasoning, reasoning_text wins, and an empty explicit value
+// counts as absent. Unlike the integration mount, this path never selects
+// reasoning_details text, so details stay structured. The integration-mount half
+// lives in core/providers/openai (TestOpenAIConverterReasoningSelection) because
+// the transports module resolves its core dependency from the module cache in a
+// plain module build. Both read the same fixture.
 //
 // The expectation is computed by referenceSelect from the input alone, so it is
 // the documented rule rather than a stored value, and each row asserts the whole
@@ -563,12 +613,15 @@ func TestNativeChatIngressReasoningSelectionFixtureIntegrity(t *testing.T) {
 	assertReferenceSelectsNothing(t)
 }
 
-// TestNativeChatIngressReasoningDetailsReachOpenAIWire drives the real native
-// ingress seam and then the provider request conversion, asserting that a request
-// whose only reasoning spelling was reasoning_details reaches the OpenAI wire as
-// non-empty reasoning_content and never leaks the ingress-only reasoning_details.
-func TestNativeChatIngressReasoningDetailsReachOpenAIWire(t *testing.T) {
-	const reasoning = "RD-MARK"
+// TestNativeChatIngressDetailsOnlyTurnHasNoWireReasoningYet drives the real native
+// ingress seam and then the provider request conversion, for a turn whose only
+// reasoning spelling was reasoning_details.
+//
+// Interim state: ingress keeps the details structured, and the outbound conversion
+// does not read them yet, so this turn reaches the OpenAI wire with no
+// reasoning_content. The egress ticket that chooses the outbound field must change
+// the first assertion to expect the replayed reasoning text.
+func TestNativeChatIngressDetailsOnlyTurnHasNoWireReasoningYet(t *testing.T) {
 	req := nativeChatRequest(t, `{"model":"deepseek-v4.1-flash","messages":[{"role":"assistant","reasoning_details":[{"index":0,"type":"reasoning.text","text":"RD-MARK"}],"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{}"}}]}]}`)
 
 	ctx, cancel := schemas.NewBifrostContextWithCancel(nil)
@@ -588,10 +641,10 @@ func TestNativeChatIngressReasoningDetailsReachOpenAIWire(t *testing.T) {
 	require.Len(t, messages, 1)
 	assistant, ok := messages[0].(map[string]any)
 	require.True(t, ok)
-	require.Equal(t, reasoning, assistant["reasoning_content"],
-		"the native ingress reasoning marker must be replayed to the custom OpenAI provider")
+	require.NotContains(t, assistant, "reasoning_content",
+		"interim: a details-only turn carries no reasoning_content until the egress ticket")
 	require.NotContains(t, assistant, "reasoning_details",
-		"reasoning_details is ingress metadata; the provider wire uses reasoning_content")
+		"reasoning_details is ingress metadata and never goes on the provider wire")
 }
 
 // TestNativeChatRequestSynthesizesReasoningForToolCalls pins the placeholder
@@ -649,5 +702,31 @@ func TestNativeChatRequestSynthesizesReasoningForToolCalls(t *testing.T) {
 		require.NotNil(t, assistant)
 		require.NotNil(t, assistant.Reasoning)
 		assert.Equal(t, "real", *assistant.Reasoning)
+	})
+
+	// The placeholder fires only when there is neither explicit text nor detail
+	// text. Each branch of that condition needs its own case.
+	t.Run("detail text is never displaced by the placeholder", func(t *testing.T) {
+		req := nativeChatRequest(t, `{"model":"opencode-go-custom/deepseek-go","messages":[
+			{"role":"assistant","reasoning_details":[{"index":0,"type":"reasoning.text","text":"REAL-DETAIL"}],"tool_calls":[`+toolCall+`]}]}`)
+
+		assistant := req.Messages[0].ChatAssistantMessage
+		require.NotNil(t, assistant)
+		assert.Nil(t, assistant.Reasoning,
+			"the placeholder must not be written over real reasoning_details text")
+		require.Len(t, assistant.ReasoningDetails, 1)
+		require.NotNil(t, assistant.ReasoningDetails[0].Text)
+		assert.Equal(t, "REAL-DETAIL", *assistant.ReasoningDetails[0].Text)
+	})
+
+	t.Run("signature-only details still gain the placeholder", func(t *testing.T) {
+		req := nativeChatRequest(t, `{"model":"opencode-go-custom/deepseek-go","messages":[
+			{"role":"assistant","reasoning_details":[{"index":0,"type":"reasoning.text","signature":"sig-only"}],"tool_calls":[`+toolCall+`]}]}`)
+
+		assistant := req.Messages[0].ChatAssistantMessage
+		require.NotNil(t, assistant)
+		require.NotNil(t, assistant.Reasoning,
+			"a detail with no text is not real reasoning, so the turn still needs the placeholder")
+		assert.Equal(t, reasoningReplayPlaceholder, *assistant.Reasoning)
 	})
 }
