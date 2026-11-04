@@ -543,6 +543,20 @@ type CustomProviderConfig struct {
 	RequestPathOverrides  map[RequestType]string `json:"request_path_overrides,omitempty"` // Mapping of request type to its custom path which will override the default path of the provider (not allowed for Bedrock)
 	DoesNotSendDoneMarker bool                   `json:"does_not_send_done_marker"`        // Upstream ends its SSE stream after finish_reason without sending data: [DONE]
 	WaitForUsage          bool                   `json:"wait_for_usage"`                   // With DoesNotSendDoneMarker, keep reading past finish_reason so the trailing usage-only chunk is not dropped (#7143). A silent upstream then ends on network_config.stream_idle_timeout_in_seconds
+
+	// ReasoningReplayField is the provider default for the wire field that upstream
+	// accepts for replayed assistant reasoning. It applies when ReasoningReplayFields
+	// has no entry for the model, or the entry is empty. Precedence, first hit wins: ReasoningReplayFields[model],
+	// this field, the datasheet record (ModelCapabilities.ReasoningReplayField), then auto.
+	// An explicit auto stops the search. Accepted values: reasoning_content, reasoning,
+	// reasoning_text, reasoning_details, none, auto. Empty means unset. Any other value
+	// is unknown and resolves to auto without consulting a lower-priority source.
+	ReasoningReplayField string `json:"reasoning_replay_field,omitempty"`
+	// ReasoningReplayFields maps a model id, exactly as the caller's request names it
+	// (the DSH alias string), to the wire field that upstream accepts for that model.
+	// It is the first layer of the precedence described on ReasoningReplayField. An
+	// empty value means unset for that model, and an unknown value resolves to auto.
+	ReasoningReplayFields map[string]string `json:"reasoning_replay_fields,omitempty"`
 }
 
 // IsOperationAllowed checks if a specific operation is allowed for this custom provider

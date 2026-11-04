@@ -83,6 +83,11 @@ type ModelCapabilities struct {
 	SupportsPromptCaching           *bool `json:"supports_prompt_caching,omitempty"`
 	SupportsWebSearch               *bool `json:"supports_web_search,omitempty"`
 
+	// Datasheet layer of ResolveReasoningReplayField, the third of its four layers. The
+	// provider's ReasoningReplayFields entry and ReasoningReplayField are consulted
+	// first, and an unknown value here resolves to auto.
+	ReasoningReplayField string `json:"reasoning_replay_field,omitempty"`
+
 	// ---- Endpoint + parameter surface ----
 
 	// Datasheet "mode" for the row (chat, embedding, image_generation, …).
