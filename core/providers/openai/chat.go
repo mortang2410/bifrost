@@ -330,16 +330,32 @@ func (req *OpenAIChatRequest) applyMistralCompatibility() {
 		}
 		if reasoning != nil && *reasoning != "" {
 			thought := *reasoning
-			blocks := []schemas.ChatContentBlock{{
-				Type:     schemas.ChatContentBlockTypeThinking,
-				Thinking: []schemas.ChatContentBlock{{Type: schemas.ChatContentBlockTypeText, Text: &thought}},
-			}}
-			if content := req.Messages[i].Content; content != nil {
-				switch {
-				case content.ContentBlocks != nil:
-					blocks = append(blocks, content.ContentBlocks...)
-				case content.ContentStr != nil:
-					blocks = append(blocks, schemas.ChatContentBlock{Type: schemas.ChatContentBlockTypeText, Text: content.ContentStr})
+			blocks := make([]schemas.ChatContentBlock, 0, 2)
+			merged := false
+			if content := req.Messages[i].Content; content != nil &&
+				len(content.ContentBlocks) > 0 &&
+				content.ContentBlocks[0].Type == schemas.ChatContentBlockTypeThinking {
+				// The caller already replayed the provider's own form, so a second
+				// leading ThinkChunk must not be opened: Mistral answers that with
+				// 400 invalid_request_invalid_args "Expected at most one leading
+				// ThinkChunk, got 2". The sibling reasoning joins the existing chunk.
+				blocks = append(blocks, content.ContentBlocks...)
+				blocks[0].Thinking = append(append([]schemas.ChatContentBlock{}, blocks[0].Thinking...),
+					schemas.ChatContentBlock{Type: schemas.ChatContentBlockTypeText, Text: &thought})
+				merged = true
+			}
+			if !merged {
+				blocks = append(blocks, schemas.ChatContentBlock{
+					Type:     schemas.ChatContentBlockTypeThinking,
+					Thinking: []schemas.ChatContentBlock{{Type: schemas.ChatContentBlockTypeText, Text: &thought}},
+				})
+				if content := req.Messages[i].Content; content != nil {
+					switch {
+					case content.ContentBlocks != nil:
+						blocks = append(blocks, content.ContentBlocks...)
+					case content.ContentStr != nil:
+						blocks = append(blocks, schemas.ChatContentBlock{Type: schemas.ChatContentBlockTypeText, Text: content.ContentStr})
+					}
 				}
 			}
 			req.Messages[i].Content = &schemas.ChatMessageContent{ContentBlocks: blocks}

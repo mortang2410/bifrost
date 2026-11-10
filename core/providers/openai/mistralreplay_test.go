@@ -145,4 +145,58 @@ func TestToOpenAIChatRequest_MistralReplaysReasoningAsThinkingChunk(t *testing.T
 			t.Fatalf("expected only a thinking block when the turn carried no text, got %#v", content)
 		}
 	})
+
+	t.Run("a caller-supplied thinking chunk absorbs the sibling reasoning", func(t *testing.T) {
+		name := "get_weather"
+		callID := "call_1"
+		callType := "function"
+		clientThought := "client-side thought"
+		request := &schemas.BifrostChatRequest{
+			Provider: schemas.Mistral,
+			Model:    "deepseek-v4-1-flash-1017",
+			Input: []schemas.ChatMessage{
+				{
+					Role:    schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{ContentStr: &userContent},
+				},
+				{
+					Role: schemas.ChatMessageRoleAssistant,
+					Content: &schemas.ChatMessageContent{ContentBlocks: []schemas.ChatContentBlock{
+						{Type: schemas.ChatContentBlockTypeThinking, Thinking: []schemas.ChatContentBlock{
+							{Type: schemas.ChatContentBlockTypeText, Text: &clientThought},
+						}},
+						{Type: schemas.ChatContentBlockTypeText, Text: &answer},
+					}},
+					ChatAssistantMessage: &schemas.ChatAssistantMessage{
+						Reasoning: &reasoning,
+						ToolCalls: []schemas.ChatAssistantMessageToolCall{{
+							Type:     &callType,
+							ID:       &callID,
+							Function: schemas.ChatAssistantMessageToolCallFunction{Name: &name, Arguments: "{}"},
+						}},
+					},
+				},
+			},
+		}
+
+		result := ToOpenAIChatRequest(ctx, request)
+		if result == nil || len(result.Messages) != 2 || result.Messages[1].OpenAIChatAssistantMessage == nil {
+			t.Fatalf("expected assistant message with OpenAI payload, got %#v", result)
+		}
+		content := result.Messages[1].Content
+		if content == nil || len(content.ContentBlocks) != 2 {
+			t.Fatalf("expected the caller's blocks to survive, got %#v", content)
+		}
+		if content.ContentBlocks[0].Type != schemas.ChatContentBlockTypeThinking {
+			t.Fatalf("expected one leading thinking block, got %#v", content.ContentBlocks[0])
+		}
+		thoughts := content.ContentBlocks[0].Thinking
+		if len(thoughts) != 2 || thoughts[0].Text == nil || *thoughts[0].Text != clientThought ||
+			thoughts[1].Text == nil || *thoughts[1].Text != reasoning {
+			t.Fatalf("expected the sibling reasoning merged into the existing chunk, got %#v", thoughts)
+		}
+		if len(result.Messages[1].OpenAIChatAssistantMessage.ToolCalls) != 1 {
+			t.Fatalf("expected the tool call to survive replay, got %#v", result.Messages[1].OpenAIChatAssistantMessage.ToolCalls)
+		}
+	})
 }
