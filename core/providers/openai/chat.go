@@ -319,19 +319,39 @@ func (req *OpenAIChatRequest) applyMistralCompatibility() {
 	// the sibling reasoning spellings with 422 extra_forbidden. Its own replay form
 	// is a "thinking" content chunk, so replayed assistant reasoning moves into the
 	// content array instead of travelling beside it.
+	// The assistant struct is nil on a plain content turn (a caller replaying the
+	// provider's own thinking form carries no sibling reasoning), so the content
+	// fold runs for every message and the sibling cleanup only where the struct
+	// exists.
 	for i := range req.Messages {
 		assistantMessage := req.Messages[i].OpenAIChatAssistantMessage
-		if assistantMessage == nil {
-			continue
+		var texts []string
+		if assistantMessage != nil {
+			texts = mistralReplayedReasoning(assistantMessage)
 		}
-		if texts := mistralReplayedReasoning(assistantMessage); len(texts) > 0 {
+		// A caller that replayed the provider's own form twice must be folded even
+		// when there is no sibling reasoning to add: Mistral answers two leading
+		// ThinkChunks with 400 invalid_request_invalid_args.
+		if len(texts) > 0 || hasLeadingThinkingSiblings(req.Messages[i].Content) {
 			req.Messages[i].Content = mistralThinkingContent(req.Messages[i].Content, texts)
 		}
-		assistantMessage.Reasoning = nil
-		assistantMessage.ReasoningAlias = nil
-		assistantMessage.ReasoningText = nil
-		assistantMessage.ReasoningDetails = nil
+		if assistantMessage != nil {
+			assistantMessage.Reasoning = nil
+			assistantMessage.ReasoningAlias = nil
+			assistantMessage.ReasoningText = nil
+			assistantMessage.ReasoningDetails = nil
+		}
 	}
+}
+
+// hasLeadingThinkingSiblings reports whether content carries more than one leading
+// thinking chunk, the shape Mistral rejects with "Expected at most one leading
+// ThinkChunk". Mistral accepts one, so the fold must run for it even when there is
+// no replayed reasoning text to append.
+func hasLeadingThinkingSiblings(content *schemas.ChatMessageContent) bool {
+	return content != nil && len(content.ContentBlocks) > 1 &&
+		content.ContentBlocks[0].Type == schemas.ChatContentBlockTypeThinking &&
+		content.ContentBlocks[1].Type == schemas.ChatContentBlockTypeThinking
 }
 
 // mistralReplayedReasoning returns the assistant text to replay as Mistral thinking

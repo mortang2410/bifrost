@@ -248,6 +248,45 @@ func TestToOpenAIChatRequest_MistralReplaysReasoningAsThinkingChunk(t *testing.T
 		}
 	})
 
+	t.Run("caller-supplied thinking chunks without sibling reasoning fold into one", func(t *testing.T) {
+		first := "first caller thought"
+		second := "second caller thought"
+		third := "third caller thought"
+		request := &schemas.BifrostChatRequest{
+			Provider: schemas.Mistral,
+			Model:    "deepseek-v4-1-flash-1017",
+			Input: []schemas.ChatMessage{
+				{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: &userContent}},
+				{
+					Role: schemas.ChatMessageRoleAssistant,
+					Content: &schemas.ChatMessageContent{ContentBlocks: []schemas.ChatContentBlock{
+						{Type: schemas.ChatContentBlockTypeThinking, Thinking: []schemas.ChatContentBlock{
+							{Type: schemas.ChatContentBlockTypeText, Text: &first},
+						}},
+						{Type: schemas.ChatContentBlockTypeThinking, Thinking: []schemas.ChatContentBlock{
+							{Type: schemas.ChatContentBlockTypeText, Text: &second},
+						}},
+						{Type: schemas.ChatContentBlockTypeThinking, Thinking: []schemas.ChatContentBlock{
+							{Type: schemas.ChatContentBlockTypeText, Text: &third},
+						}},
+						{Type: schemas.ChatContentBlockTypeText, Text: &answer},
+					}},
+				},
+			},
+		}
+
+		result := ToOpenAIChatRequest(ctx, request)
+		content := result.Messages[1].Content
+		if content == nil || len(content.ContentBlocks) != 2 ||
+			content.ContentBlocks[0].Type != schemas.ChatContentBlockTypeThinking {
+			t.Fatalf("expected one leading thinking chunk plus the answer, got %#v", content)
+		}
+		thoughts := content.ContentBlocks[0].Thinking
+		if len(thoughts) != 3 || *thoughts[0].Text != first || *thoughts[1].Text != second || *thoughts[2].Text != third {
+			t.Fatalf("expected all three texts under the leading chunk, got %#v", thoughts)
+		}
+	})
+
 	t.Run("identical reasoning is not replayed twice", func(t *testing.T) {
 		request := &schemas.BifrostChatRequest{
 			Provider: schemas.Mistral,
