@@ -2,6 +2,7 @@ package schemas
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -26,6 +27,8 @@ func TestChatStreamDeltaFoldsMistralTypedContentChunks(t *testing.T) {
 		require.Len(t, response.Choices, 1)
 		delta := response.Choices[0].Delta
 		require.NotNil(t, delta, "typed thinking chunk must decode instead of dropping the frame")
+		require.NotNil(t, delta.Role, "the frame must survive unmarshalling, not merely stop erroring")
+		assert.Equal(t, "assistant", *delta.Role)
 		assert.Nil(t, delta.Content, "a thinking-only frame carries no visible text")
 		require.NotNil(t, delta.Reasoning, "thinking text must land on the reasoning field")
 		assert.Equal(t, "I multiplied seven by six.", *delta.Reasoning)
@@ -57,9 +60,35 @@ func TestChatStreamDeltaFoldsMistralTypedContentChunks(t *testing.T) {
 	})
 
 	t.Run("frame with no usable part is left to the caller", func(t *testing.T) {
-		raw := `{"delta":{"content":[{"type":"image_url","image_url":{"url":"https://example.test/i.png"}}]}}`
-		if folded, ok := foldTypedContentChunks([]byte(raw)); ok {
-			t.Fatalf("expected no fold for a single-element array with no text part, got %s", folded)
+		raw := `{"content":[{"type":"image_url","image_url":{"url":"https://example.test/i.png"}}]}`
+		if folded, ok := foldTypedContentChunks([]byte(raw)); !ok {
+			t.Fatal("expected an array to fold even when it has no text part, so the frame is not dropped")
+		} else if strings.Contains(string(folded), `"content"`) {
+			t.Fatalf("expected the unusable content key to be dropped, got %s", folded)
 		}
+	})
+
+	t.Run("chunk type matching ignores case", func(t *testing.T) {
+		raw := `{"choices":[{"index":0,"delta":{"content":[{"type":"Text","text":"42"},{"type":"THINKING","thinking":[{"type":"text","text":"thought"}]}]}}]}`
+
+		var response BifrostChatResponse
+		require.NoError(t, json.Unmarshal([]byte(raw), &response))
+		delta := response.Choices[0].Delta
+		require.NotNil(t, delta)
+		require.NotNil(t, delta.Content)
+		assert.Equal(t, "42", *delta.Content)
+		require.NotNil(t, delta.Reasoning)
+		assert.Equal(t, "thought", *delta.Reasoning)
+	})
+
+	t.Run("typed thinking is appended to a sibling reasoning key", func(t *testing.T) {
+		raw := `{"choices":[{"index":0,"delta":{"content":[{"type":"thinking","thinking":[{"type":"text","text":" second"}]}],"reasoning":"first"}}]}`
+
+		var response BifrostChatResponse
+		require.NoError(t, json.Unmarshal([]byte(raw), &response))
+		delta := response.Choices[0].Delta
+		require.NotNil(t, delta)
+		require.NotNil(t, delta.Reasoning, "a typed thinking chunk must not be dropped when a sibling reasoning key is present")
+		assert.Equal(t, "first second", *delta.Reasoning)
 	})
 }

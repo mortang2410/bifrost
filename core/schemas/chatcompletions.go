@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -1888,9 +1889,6 @@ func (d ChatStreamResponseChoiceDelta) MarshalJSON() ([]byte, error) {
 	})
 }
 
-// UnmarshalJSON implements custom unmarshalling for ChatStreamResponseChoiceDelta.
-// If Reasoning is non-nil and ReasoningDetails is nil/empty, it adds a single
-// ChatReasoningDetails entry of type "reasoning.text" with the text set to Reasoning.
 // fallbackTypedContentChunk is one element of a Mistral-style typed content
 // array: either a "text" chunk carrying a string, or a "thinking" chunk whose
 // own array carries text parts. Mistral streams reasoning this way instead of
@@ -1914,22 +1912,18 @@ func foldTypedContentChunks(data []byte) ([]byte, bool) {
 		return nil, false
 	}
 
-	var fields map[string]json.RawMessage
-	if err := Unmarshal(data, &fields); err != nil {
-		return nil, false
-	}
-	rawContent, ok := fields["content"]
-	if !ok {
+	content := gjson.GetBytes(data, "content")
+	if !content.IsArray() {
 		return nil, false
 	}
 	var chunks []fallbackTypedContentChunk
-	if err := Unmarshal(rawContent, &chunks); err != nil {
+	if err := Unmarshal([]byte(content.Raw), &chunks); err != nil {
 		return nil, false
 	}
 
 	var text, thinking bytes.Buffer
 	for _, chunk := range chunks {
-		switch chunk.Type {
+		switch strings.ToLower(chunk.Type) {
 		case "text":
 			text.WriteString(chunk.Text)
 		case "thinking":
@@ -1938,38 +1932,42 @@ func foldTypedContentChunks(data []byte) ([]byte, bool) {
 			}
 		}
 	}
-	if text.Len() == 0 && thinking.Len() == 0 {
-		return nil, false
-	}
 
-	encodedText, err := Marshal(text.String())
-	if err != nil {
-		return nil, false
-	}
+	// An array always folds, even with no usable part: leaving it alone makes the
+	// caller drop the frame, which is exactly the loss this exists to prevent.
+	out := append([]byte(nil), data...)
+	var err error
 	if text.Len() > 0 {
-		fields["content"] = encodedText
+		out, err = sjson.SetBytes(out, "content", text.String())
+		if err != nil {
+			return nil, false
+		}
 	} else {
 		// A thinking-only frame carries no visible text; dropping the key keeps
 		// the emitted delta free of an empty content string.
-		delete(fields, "content")
-	}
-	if thinking.Len() > 0 {
-		if _, exists := fields["reasoning"]; !exists {
-			encodedReasoning, err := Marshal(thinking.String())
-			if err != nil {
-				return nil, false
-			}
-			fields["reasoning"] = encodedReasoning
+		out, err = sjson.DeleteBytes(out, "content")
+		if err != nil {
+			return nil, false
 		}
 	}
-
-	folded, err := Marshal(fields)
-	if err != nil {
-		return nil, false
+	if thinking.Len() > 0 {
+		merged := thinking.String()
+		if existing := gjson.GetBytes(out, "reasoning"); existing.Type == gjson.String && existing.String() != "" {
+			// A sibling reasoning key is part of the same phase; append instead of
+			// discarding the typed thinking this frame carries.
+			merged = existing.String() + merged
+		}
+		out, err = sjson.SetBytes(out, "reasoning", merged)
+		if err != nil {
+			return nil, false
+		}
 	}
-	return folded, true
+	return out, true
 }
 
+// UnmarshalJSON implements custom unmarshalling for ChatStreamResponseChoiceDelta.
+// If Reasoning is non-nil and ReasoningDetails is nil/empty, it adds a single
+// ChatReasoningDetails entry of type "reasoning.text" with the text set to Reasoning.
 func (d *ChatStreamResponseChoiceDelta) UnmarshalJSON(data []byte) error {
 	// A provider that streams typed content chunks (Mistral) is folded to the
 	// string shape first; every other delta passes through untouched.

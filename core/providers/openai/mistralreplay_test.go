@@ -103,4 +103,46 @@ func TestToOpenAIChatRequest_MistralReplaysReasoningAsThinkingChunk(t *testing.T
 			t.Fatalf("expected reasoning to survive for a non-Mistral provider, got %#v", assistant)
 		}
 	})
+
+	t.Run("tool-call turn keeps its calls beside the thinking block", func(t *testing.T) {
+		name := "get_weather"
+		callID := "call_1"
+		callType := "function"
+		toolReasoning := "I should check the weather"
+		request := &schemas.BifrostChatRequest{
+			Provider: schemas.Mistral,
+			Model:    "deepseek-v4-1-flash-1017",
+			Input: []schemas.ChatMessage{
+				{
+					Role:    schemas.ChatMessageRoleUser,
+					Content: &schemas.ChatMessageContent{ContentStr: &userContent},
+				},
+				{
+					Role: schemas.ChatMessageRoleAssistant,
+					ChatAssistantMessage: &schemas.ChatAssistantMessage{
+						Reasoning: &toolReasoning,
+						ToolCalls: []schemas.ChatAssistantMessageToolCall{{
+							Type:     &callType,
+							ID:       &callID,
+							Function: schemas.ChatAssistantMessageToolCallFunction{Name: &name, Arguments: "{}"},
+						}},
+					},
+				},
+			},
+		}
+
+		result := ToOpenAIChatRequest(ctx, request)
+		if result == nil || len(result.Messages) != 2 || result.Messages[1].OpenAIChatAssistantMessage == nil {
+			t.Fatalf("expected assistant message with OpenAI payload, got %#v", result)
+		}
+		assistant := result.Messages[1].OpenAIChatAssistantMessage
+		if len(assistant.ToolCalls) != 1 {
+			t.Fatalf("expected the tool call to survive replay, got %#v", assistant.ToolCalls)
+		}
+		content := result.Messages[1].Content
+		if content == nil || len(content.ContentBlocks) != 1 ||
+			content.ContentBlocks[0].Type != schemas.ChatContentBlockTypeThinking {
+			t.Fatalf("expected only a thinking block when the turn carried no text, got %#v", content)
+		}
+	})
 }
