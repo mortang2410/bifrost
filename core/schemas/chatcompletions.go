@@ -1883,7 +1883,92 @@ func (d ChatStreamResponseChoiceDelta) MarshalJSON() ([]byte, error) {
 // UnmarshalJSON implements custom unmarshalling for ChatStreamResponseChoiceDelta.
 // If Reasoning is non-nil and ReasoningDetails is nil/empty, it adds a single
 // ChatReasoningDetails entry of type "reasoning.text" with the text set to Reasoning.
+// fallbackTypedContentChunk is one element of a Mistral-style typed content
+// array: either a "text" chunk carrying a string, or a "thinking" chunk whose
+// own array carries text parts. Mistral streams reasoning this way instead of
+// using a sibling reasoning_content field, so a delta typed as Content *string
+// fails to decode and the frame is dropped by the caller.
+type fallbackTypedContentChunk struct {
+	Type     string `json:"type"`
+	Text     string `json:"text"`
+	Thinking []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"thinking"`
+}
+
+// foldTypedContentChunks rewrites a stream delta whose "content" is an array of
+// typed chunks into the string form Bifrost models: text parts are concatenated
+// into content and thinking parts into the reasoning field. It reports false,
+// leaving the payload untouched, whenever the delta is not in that shape.
+func foldTypedContentChunks(data []byte) ([]byte, bool) {
+	if !bytes.Contains(data, []byte(`"content":[`)) && !bytes.Contains(data, []byte(`"content": [`)) {
+		return nil, false
+	}
+
+	var fields map[string]json.RawMessage
+	if err := Unmarshal(data, &fields); err != nil {
+		return nil, false
+	}
+	rawContent, ok := fields["content"]
+	if !ok {
+		return nil, false
+	}
+	var chunks []fallbackTypedContentChunk
+	if err := Unmarshal(rawContent, &chunks); err != nil {
+		return nil, false
+	}
+
+	var text, thinking bytes.Buffer
+	for _, chunk := range chunks {
+		switch chunk.Type {
+		case "text":
+			text.WriteString(chunk.Text)
+		case "thinking":
+			for _, part := range chunk.Thinking {
+				thinking.WriteString(part.Text)
+			}
+		}
+	}
+	if text.Len() == 0 && thinking.Len() == 0 {
+		return nil, false
+	}
+
+	encodedText, err := Marshal(text.String())
+	if err != nil {
+		return nil, false
+	}
+	if text.Len() > 0 {
+		fields["content"] = encodedText
+	} else {
+		// A thinking-only frame carries no visible text; dropping the key keeps
+		// the emitted delta free of an empty content string.
+		delete(fields, "content")
+	}
+	if thinking.Len() > 0 {
+		if _, exists := fields["reasoning"]; !exists {
+			encodedReasoning, err := Marshal(thinking.String())
+			if err != nil {
+				return nil, false
+			}
+			fields["reasoning"] = encodedReasoning
+		}
+	}
+
+	folded, err := Marshal(fields)
+	if err != nil {
+		return nil, false
+	}
+	return folded, true
+}
+
 func (d *ChatStreamResponseChoiceDelta) UnmarshalJSON(data []byte) error {
+	// A provider that streams typed content chunks (Mistral) is folded to the
+	// string shape first; every other delta passes through untouched.
+	if folded, ok := foldTypedContentChunks(data); ok {
+		data = folded
+	}
+
 	// Alias to avoid infinite recursion
 	type Alias ChatStreamResponseChoiceDelta
 

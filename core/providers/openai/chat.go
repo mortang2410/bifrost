@@ -303,6 +303,22 @@ func (req *OpenAIChatRequest) applyMistralCompatibility() {
 			req.Reasoning.Effort = schemas.Ptr("high")
 		}
 	}
+
+	// Mistral's message schema is closed (additionalProperties: false) and rejects
+	// the sibling reasoning spellings with 422 extra_forbidden, so a replayed
+	// assistant turn must not carry reasoning_content/reasoning/reasoning_details.
+	// Mistral's own replay form is a "thinking" content chunk, which egress does
+	// not emit yet; dropping the sibling fields keeps multi-turn requests valid.
+	for i := range req.Messages {
+		assistantMessage := req.Messages[i].OpenAIChatAssistantMessage
+		if assistantMessage == nil {
+			continue
+		}
+		assistantMessage.Reasoning = nil
+		assistantMessage.ReasoningAlias = nil
+		assistantMessage.ReasoningText = nil
+		assistantMessage.ReasoningDetails = nil
+	}
 }
 
 // stripReasoningDetailsExceptToolCalls strips reasoning_content from assistant messages that
