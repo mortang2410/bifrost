@@ -1293,6 +1293,10 @@ const (
 	ChatContentBlockTypeInputAudio ChatContentBlockType = "input_audio"
 	ChatContentBlockTypeFile       ChatContentBlockType = "file"
 	ChatContentBlockTypeRefusal    ChatContentBlockType = "refusal"
+	// ChatContentBlockTypeThinking is Mistral's replay form for assistant
+	// reasoning: a content block whose own array carries text chunks, instead of
+	// a sibling reasoning field the provider's closed schema rejects.
+	ChatContentBlockTypeThinking ChatContentBlockType = "thinking"
 )
 
 // ChatContentBlock represents a content block in a message.
@@ -1303,6 +1307,10 @@ type ChatContentBlock struct {
 	ImageURLStruct *ChatInputImage      `json:"image_url,omitempty"`
 	InputAudio     *ChatInputAudio      `json:"input_audio,omitempty"`
 	File           *ChatInputFile       `json:"file,omitempty"`
+
+	// Thinking carries the nested text chunks of a "thinking" block, the shape
+	// Mistral accepts for replayed assistant reasoning.
+	Thinking []ChatContentBlock `json:"thinking,omitempty"`
 
 	// Not in OpenAI's schemas, but sent by a few providers (Anthropic, Bedrock are some of them)
 	CacheControl *CacheControl `json:"cache_control,omitempty"`

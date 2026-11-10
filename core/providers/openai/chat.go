@@ -305,14 +305,44 @@ func (req *OpenAIChatRequest) applyMistralCompatibility() {
 	}
 
 	// Mistral's message schema is closed (additionalProperties: false) and rejects
-	// the sibling reasoning spellings with 422 extra_forbidden, so a replayed
-	// assistant turn must not carry reasoning_content/reasoning/reasoning_details.
-	// Mistral's own replay form is a "thinking" content chunk, which egress does
-	// not emit yet; dropping the sibling fields keeps multi-turn requests valid.
+	// the sibling reasoning spellings with 422 extra_forbidden. Its own replay form
+	// is a "thinking" content chunk, so replayed assistant reasoning moves into the
+	// content array instead of travelling beside it.
 	for i := range req.Messages {
 		assistantMessage := req.Messages[i].OpenAIChatAssistantMessage
 		if assistantMessage == nil {
 			continue
+		}
+		reasoning := assistantMessage.Reasoning
+		if reasoning == nil {
+			reasoning = assistantMessage.ReasoningAlias
+		}
+		if reasoning == nil {
+			reasoning = assistantMessage.ReasoningText
+		}
+		if reasoning == nil {
+			for _, details := range assistantMessage.ReasoningDetails {
+				if details.Text != nil {
+					reasoning = details.Text
+					break
+				}
+			}
+		}
+		if reasoning != nil && *reasoning != "" {
+			thought := *reasoning
+			blocks := []schemas.ChatContentBlock{{
+				Type:     schemas.ChatContentBlockTypeThinking,
+				Thinking: []schemas.ChatContentBlock{{Type: schemas.ChatContentBlockTypeText, Text: &thought}},
+			}}
+			if content := req.Messages[i].Content; content != nil {
+				switch {
+				case content.ContentBlocks != nil:
+					blocks = append(blocks, content.ContentBlocks...)
+				case content.ContentStr != nil:
+					blocks = append(blocks, schemas.ChatContentBlock{Type: schemas.ChatContentBlockTypeText, Text: content.ContentStr})
+				}
+			}
+			req.Messages[i].Content = &schemas.ChatMessageContent{ContentBlocks: blocks}
 		}
 		assistantMessage.Reasoning = nil
 		assistantMessage.ReasoningAlias = nil

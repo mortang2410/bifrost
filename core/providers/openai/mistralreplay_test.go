@@ -11,9 +11,9 @@ import (
 // Mistral rejects the sibling reasoning spellings with 422 extra_forbidden: its
 // message schema is closed (additionalProperties: false), and its own replay
 // form is a "thinking" content chunk. A replayed assistant turn therefore must
-// not carry reasoning_content, reasoning, reasoning_text or reasoning_details,
-// or every multi-turn request on a Mistral route fails.
-func TestToOpenAIChatRequest_MistralDropsReplayedReasoning(t *testing.T) {
+// carry its reasoning inside the content array and no reasoning_content,
+// reasoning, reasoning_text or reasoning_details beside it.
+func TestToOpenAIChatRequest_MistralReplaysReasoningAsThinkingChunk(t *testing.T) {
 	ctx, cancel := schemas.NewBifrostContextWithCancel(nil)
 	defer cancel()
 
@@ -54,7 +54,7 @@ func TestToOpenAIChatRequest_MistralDropsReplayedReasoning(t *testing.T) {
 		return string(body)
 	}
 
-	t.Run("mistral carries no reasoning field on the wire", func(t *testing.T) {
+	t.Run("mistral replays reasoning as a thinking content chunk", func(t *testing.T) {
 		result := ToOpenAIChatRequest(ctx, buildRequest(schemas.Mistral))
 		if result == nil {
 			t.Fatal("expected non-nil result")
@@ -68,11 +68,28 @@ func TestToOpenAIChatRequest_MistralDropsReplayedReasoning(t *testing.T) {
 			t.Fatalf("expected every reasoning spelling cleared, got %#v", assistant)
 		}
 
+		content := result.Messages[1].Content
+		if content == nil || len(content.ContentBlocks) != 2 {
+			t.Fatalf("expected a thinking block and the answer block, got %#v", content)
+		}
+		thinking := content.ContentBlocks[0]
+		if thinking.Type != schemas.ChatContentBlockTypeThinking || len(thinking.Thinking) != 1 ||
+			thinking.Thinking[0].Text == nil || *thinking.Thinking[0].Text != reasoning {
+			t.Fatalf("expected the reasoning inside a thinking block, got %#v", thinking)
+		}
+		answerBlock := content.ContentBlocks[1]
+		if answerBlock.Type != schemas.ChatContentBlockTypeText || answerBlock.Text == nil || *answerBlock.Text != answer {
+			t.Fatalf("expected the answer text after the thinking block, got %#v", answerBlock)
+		}
+
 		wire := encodedMessages(t, result)
-		for _, key := range []string{"reasoning_content", `"reasoning"`, "reasoning_text", "reasoning_details"} {
+		for _, key := range []string{"reasoning_content", "reasoning_text", "reasoning_details"} {
 			if strings.Contains(wire, key) {
 				t.Fatalf("wire payload must not carry %s, got %s", key, wire)
 			}
+		}
+		if !strings.Contains(wire, `"thinking":[{"type":"text","text":"seven times six"}]`) {
+			t.Fatalf("expected the thinking chunk on the wire, got %s", wire)
 		}
 	})
 
