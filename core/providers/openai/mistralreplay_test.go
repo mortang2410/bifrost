@@ -198,5 +198,187 @@ func TestToOpenAIChatRequest_MistralReplaysReasoningAsThinkingChunk(t *testing.T
 		if len(result.Messages[1].OpenAIChatAssistantMessage.ToolCalls) != 1 {
 			t.Fatalf("expected the tool call to survive replay, got %#v", result.Messages[1].OpenAIChatAssistantMessage.ToolCalls)
 		}
+		wire := encodedMessages(t, result)
+		if !strings.Contains(wire, `"thinking":[{"type":"text","text":"client-side thought"},{"type":"text","text":"seven times six"}]`) {
+			t.Fatalf("expected both texts in one leading thinking chunk, got %s", wire)
+		}
+		for _, key := range []string{"reasoning_content", "reasoning_text", "reasoning_details"} {
+			if strings.Contains(wire, key) {
+				t.Fatalf("wire payload must not carry %s, got %s", key, wire)
+			}
+		}
 	})
+
+	t.Run("two caller-supplied thinking chunks fold into one", func(t *testing.T) {
+		first := "first caller thought"
+		second := "second caller thought"
+		request := &schemas.BifrostChatRequest{
+			Provider: schemas.Mistral,
+			Model:    "deepseek-v4-1-flash-1017",
+			Input: []schemas.ChatMessage{
+				{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: &userContent}},
+				{
+					Role: schemas.ChatMessageRoleAssistant,
+					Content: &schemas.ChatMessageContent{ContentBlocks: []schemas.ChatContentBlock{
+						{Type: schemas.ChatContentBlockTypeThinking, Thinking: []schemas.ChatContentBlock{
+							{Type: schemas.ChatContentBlockTypeText, Text: &first},
+						}},
+						{Type: schemas.ChatContentBlockTypeThinking, Thinking: []schemas.ChatContentBlock{
+							{Type: schemas.ChatContentBlockTypeText, Text: &second},
+						}},
+						{Type: schemas.ChatContentBlockTypeText, Text: &answer},
+					}},
+					ChatAssistantMessage: &schemas.ChatAssistantMessage{Reasoning: &reasoning},
+				},
+			},
+		}
+
+		result := ToOpenAIChatRequest(ctx, request)
+		if result == nil || len(result.Messages) != 2 {
+			t.Fatalf("expected two messages, got %#v", result)
+		}
+		content := result.Messages[1].Content
+		if content == nil || len(content.ContentBlocks) != 2 ||
+			content.ContentBlocks[0].Type != schemas.ChatContentBlockTypeThinking {
+			t.Fatalf("expected one thinking block plus the answer, got %#v", content)
+		}
+		thoughts := content.ContentBlocks[0].Thinking
+		if len(thoughts) != 3 || *thoughts[0].Text != first || *thoughts[1].Text != second || *thoughts[2].Text != reasoning {
+			t.Fatalf("expected all three texts under one leading chunk, got %#v", thoughts)
+		}
+	})
+
+	t.Run("identical reasoning is not replayed twice", func(t *testing.T) {
+		request := &schemas.BifrostChatRequest{
+			Provider: schemas.Mistral,
+			Model:    "deepseek-v4-1-flash-1017",
+			Input: []schemas.ChatMessage{
+				{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: &userContent}},
+				{
+					Role: schemas.ChatMessageRoleAssistant,
+					Content: &schemas.ChatMessageContent{ContentBlocks: []schemas.ChatContentBlock{
+						{Type: schemas.ChatContentBlockTypeThinking, Thinking: []schemas.ChatContentBlock{
+							{Type: schemas.ChatContentBlockTypeText, Text: &reasoning},
+						}},
+						{Type: schemas.ChatContentBlockTypeText, Text: &answer},
+					}},
+					ChatAssistantMessage: &schemas.ChatAssistantMessage{Reasoning: &reasoning},
+				},
+			},
+		}
+
+		result := ToOpenAIChatRequest(ctx, request)
+		content := result.Messages[1].Content
+		if content == nil || len(content.ContentBlocks[0].Thinking) != 1 {
+			t.Fatalf("expected the duplicate text to be skipped, got %#v", content)
+		}
+	})
+
+	t.Run("every non-empty reasoning detail is replayed", func(t *testing.T) {
+		firstDetail := "first detail"
+		secondDetail := "second detail"
+		emptyDetail := ""
+		cases := []struct {
+			label    string
+			details  []*string
+			expected []string
+		}{
+			{"two texts", []*string{&firstDetail, &secondDetail}, []string{firstDetail, secondDetail}},
+			{"empty first text", []*string{&emptyDetail, &secondDetail}, []string{secondDetail}},
+		}
+		// The details spelling is what a provider config names when upstream accepts
+		// reasoning_details; the fold must not keep only the first text.
+		custom := &schemas.CustomProviderConfig{ReasoningReplayField: schemas.ReasoningReplayReasoningDetails}
+		for _, tc := range cases {
+			reasoningDetails := make([]schemas.ChatReasoningDetails, 0, len(tc.details))
+			for index, text := range tc.details {
+				reasoningDetails = append(reasoningDetails, schemas.ChatReasoningDetails{Index: index, Type: schemas.BifrostReasoningDetailsTypeText, Text: text})
+			}
+			request := &schemas.BifrostChatRequest{
+				Provider: schemas.Mistral,
+				Model:    "deepseek-v4-1-flash-1017",
+				Input: []schemas.ChatMessage{
+					{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: &userContent}},
+					{
+						Role:                 schemas.ChatMessageRoleAssistant,
+						Content:              &schemas.ChatMessageContent{ContentStr: &answer},
+						ChatAssistantMessage: &schemas.ChatAssistantMessage{ReasoningDetails: reasoningDetails},
+					},
+				},
+			}
+
+			result := ToOpenAIChatRequestForProvider(ctx, request, custom)
+			content := result.Messages[1].Content
+			if content == nil || len(content.ContentBlocks) == 0 ||
+				content.ContentBlocks[0].Type != schemas.ChatContentBlockTypeThinking {
+				t.Fatalf("%s: expected a thinking block, got %#v", tc.label, content)
+			}
+			thoughts := content.ContentBlocks[0].Thinking
+			if len(thoughts) != len(tc.expected) {
+				t.Fatalf("%s: expected %d texts, got %#v", tc.label, len(tc.expected), thoughts)
+			}
+			for index, text := range tc.expected {
+				if thoughts[index].Text == nil || *thoughts[index].Text != text {
+					t.Fatalf("%s: expected %q at %d, got %#v", tc.label, text, index, thoughts)
+				}
+			}
+		}
+	})
+
+	t.Run("an empty caller thinking chunk still receives the sibling", func(t *testing.T) {
+		request := &schemas.BifrostChatRequest{
+			Provider: schemas.Mistral,
+			Model:    "deepseek-v4-1-flash-1017",
+			Input: []schemas.ChatMessage{
+				{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: &userContent}},
+				{
+					Role: schemas.ChatMessageRoleAssistant,
+					Content: &schemas.ChatMessageContent{ContentBlocks: []schemas.ChatContentBlock{
+						{Type: schemas.ChatContentBlockTypeThinking},
+						{Type: schemas.ChatContentBlockTypeText, Text: &answer},
+					}},
+					ChatAssistantMessage: &schemas.ChatAssistantMessage{Reasoning: &reasoning},
+				},
+			},
+		}
+
+		result := ToOpenAIChatRequest(ctx, request)
+		content := result.Messages[1].Content
+		if content == nil || len(content.ContentBlocks) != 2 {
+			t.Fatalf("expected the caller's blocks, got %#v", content)
+		}
+		thoughts := content.ContentBlocks[0].Thinking
+		if len(thoughts) != 1 || thoughts[0].Text == nil || *thoughts[0].Text != reasoning {
+			t.Fatalf("expected the sibling text in the empty chunk, got %#v", thoughts)
+		}
+	})
+}
+
+// Mistral documents a closed reasoning_effort enum (none, minimal, low, medium,
+// high, xhigh, max) and answers an out-of-enum value with a validation error. The
+// gateway must forward the caller's level rather than collapsing it to one it
+// considers supported.
+func TestToOpenAIChatRequest_MistralForwardsDocumentedReasoningEffort(t *testing.T) {
+	ctx, cancel := schemas.NewBifrostContextWithCancel(nil)
+	defer cancel()
+
+	userContent := "What is 7*6?"
+	for _, effort := range []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"} {
+		request := &schemas.BifrostChatRequest{
+			Provider: schemas.Mistral,
+			Model:    "deepseek-v4-1-flash-1017",
+			Params:   &schemas.ChatParameters{Reasoning: &schemas.ChatReasoning{Effort: &effort}},
+			Input: []schemas.ChatMessage{
+				{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: &userContent}},
+			},
+		}
+
+		result := ToOpenAIChatRequest(ctx, request)
+		if result == nil || result.Reasoning == nil || result.Reasoning.Effort == nil {
+			t.Fatalf("%s: expected the effort to survive, got %#v", effort, result)
+		}
+		if got := *result.Reasoning.Effort; got != effort {
+			t.Fatalf("%s: expected the effort forwarded unchanged, got %q", effort, got)
+		}
+	}
 }
