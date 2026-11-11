@@ -214,7 +214,11 @@ func (req *OpenAIChatRequest) filterOpenAISpecificParameters(caps schemas.ModelC
 	if caps.FieldUnsupported(schemas.FieldPrediction, true) {
 		req.ChatParameters.Prediction = nil
 	}
-	if caps.FieldUnsupported(schemas.FieldPromptCacheKey, true) {
+	// Mistral documents prompt_cache_key as the control for its own prompt cache
+	// (docs.mistral.ai/inference/conversations/advanced/prompt-caching), so the
+	// compat default must not strip it there. Every other provider keeps the
+	// fail-closed default until a datasheet row opts it in.
+	if caps.FieldUnsupported(schemas.FieldPromptCacheKey, caps.Provider() != schemas.Mistral) {
 		req.ChatParameters.PromptCacheKey = nil
 	}
 	if caps.FieldUnsupported(schemas.FieldPromptCacheRetention, true) {

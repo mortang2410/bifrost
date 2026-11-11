@@ -2130,3 +2130,35 @@ func TestOpenAICompatFiltersReadDatasheet(t *testing.T) {
 		require.Nil(t, req.FrequencyPenalty, "fields the row omits keep the grok name-based default")
 	})
 }
+
+// TestToOpenAIChatRequest_MistralKeepsPromptCacheKey pins the documented Mistral
+// control. docs.mistral.ai/inference/conversations/advanced/prompt-caching tells
+// callers to send the same prompt_cache_key on requests that share a prefix, so
+// the compat fallback that strips the field must not apply to Mistral.
+func TestToOpenAIChatRequest_MistralKeepsPromptCacheKey(t *testing.T) {
+	ctx, cancel := schemas.NewBifrostContextWithCancel(nil)
+	defer cancel()
+
+	cacheKey := "session-abc"
+	userContent := "hello"
+	bifrostReq := &schemas.BifrostChatRequest{
+		Provider: schemas.Mistral,
+		Model:    "mistral-large-latest",
+		Input: []schemas.ChatMessage{{
+			Role:    schemas.ChatMessageRoleUser,
+			Content: &schemas.ChatMessageContent{ContentStr: &userContent},
+		}},
+		Params: &schemas.ChatParameters{PromptCacheKey: &cacheKey},
+	}
+
+	result := ToOpenAIChatRequest(ctx, bifrostReq)
+	require.NotNil(t, result)
+	require.NotNil(t, result.PromptCacheKey, "Mistral documents prompt_cache_key; it must not be stripped")
+	require.Equal(t, cacheKey, *result.PromptCacheKey)
+
+	// The same request on a compat provider still strips it.
+	bifrostReq.Provider = schemas.Fireworks
+	compat := ToOpenAIChatRequest(ctx, bifrostReq)
+	require.NotNil(t, compat)
+	require.Nil(t, compat.PromptCacheKey, "compat providers keep the fail-closed default")
+}
