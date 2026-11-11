@@ -457,6 +457,25 @@ func (cr *ChatRequest) UnmarshalJSON(data []byte) error {
 	}
 	cr.Messages = msgStruct.Messages
 
+	// The shared schema decoder resolves reasoning, reasoning_content, and
+	// reasoning_text in its own order, with "reasoning" first. Response decoding
+	// must keep that order, so the native request seam re-resolves the explicit
+	// spellings here from the raw values, preferring reasoning_content to match the
+	// OpenAI-wire converter. The raw struct decodes reasoning_details into a
+	// concrete detail slice, not raw bytes, so this pass allocates a second copy of
+	// the detail payload. That duplication is a measured,
+	// accepted cost: it is what lets the pass tell a caller-supplied non-empty
+	// details array from one the shared decoder synthesized. An explicitly empty
+	// array is not distinguished from an absent one, which is deliberate: both
+	// mean the caller supplied no detail text, and the selection is unaffected.
+	var rawStruct struct {
+		Messages []nativeRawReasoning `json:"messages"`
+	}
+	if err := sonic.Unmarshal(data, &rawStruct); err != nil {
+		return err
+	}
+	normalizeNativeReasoning(cr.Model, cr.Messages, rawStruct.Messages)
+
 	// Unmarshal ChatParameters (which has its own custom unmarshaller)
 	if cr.ChatParameters == nil {
 		cr.ChatParameters = &schemas.ChatParameters{}
@@ -466,6 +485,136 @@ func (cr *ChatRequest) UnmarshalJSON(data []byte) error {
 	}
 
 	return nil
+}
+
+// nativeRawReasoning holds the reasoning spellings exactly as the caller sent
+// them. ChatMessage keeps only one decoded value, which is not enough to apply
+// the precedence rule below. reasoning_details is decoded into the concrete
+// detail type, and only to tell a caller-supplied non-empty array from one the
+// decoder synthesized; its text is never read here, because the decoded message
+// already carries the details that reach provider conversion. An explicitly empty
+// array is treated as no array, because both supply no detail text.
+type nativeRawReasoning struct {
+	Reasoning        *string                        `json:"reasoning"`
+	ReasoningContent *string                        `json:"reasoning_content"`
+	ReasoningText    *string                        `json:"reasoning_text"`
+	ReasoningDetails []schemas.ChatReasoningDetails `json:"reasoning_details"`
+}
+
+// normalizeNativeReasoning resolves replayed assistant reasoning on the native
+// POST /v1/chat/completions request path, which decodes messages straight into
+// the Bifrost schema instead of going through the OpenAI integration converter.
+// The schema decoder is shared with provider-response decoding, where rewriting
+// the message would change what clients see, so this function supplies the
+// request-side precedence only.
+//
+// Precedence matches ConvertOpenAIMessagesToBifrostMessages for the explicit
+// spellings: the first non-empty of reasoning_content, reasoning, reasoning_text.
+// An empty explicit value counts as absent. The explicit value applies to any
+// role, matching the schema decoder and the OpenAI converter.
+//
+// reasoning_details text is never copied onto Reasoning. Details stay structured,
+// with their signatures and metadata untouched. Until the outbound conversion reads
+// them, a details-only turn reaches the provider with no reasoning_content.
+func normalizeNativeReasoning(model string, messages []schemas.ChatMessage, raw []nativeRawReasoning) {
+	for i := range messages {
+		if i >= len(raw) {
+			continue
+		}
+		assistant := messages[i].ChatAssistantMessage
+
+		// Explicit spellings are resolved first, before any skip. The schema decoder
+		// resolves them in a different order, so the winner is set here. If no
+		// assistant field survived decoding, ChatAssistantMessage is nil and is
+		// created here.
+		if explicit, source := explicitReasoning(raw[i]); explicit != nil {
+			if assistant == nil {
+				assistant = &schemas.ChatAssistantMessage{}
+				messages[i].ChatAssistantMessage = assistant
+			}
+			assistant.Reasoning = explicit
+			assistant.ReasoningSource = source
+		}
+		if assistant == nil {
+			continue
+		}
+
+		// DeepSeek-shaped thinking mode also rejects an assistant tool-call turn
+		// that replays no reasoning at all, and rejects an empty replay too: a
+		// request with the field absent or empty fails with "The `reasoning_content`
+		// in the thinking mode must be passed back to the API", while any non-empty
+		// text passes. The caller may hold no reasoning for such a turn, because the
+		// model produced none or a gateway dropped it, so a minimal placeholder keeps
+		// the turn replayable instead of failing the whole request. The placeholder
+		// fires only when there is neither explicit reasoning text nor detail text,
+		// so it never displaces real text. ReasoningSource stays empty, because no
+		// caller spelling produced the placeholder.
+		if assistant.Reasoning == nil &&
+			messages[i].Role == schemas.ChatMessageRoleAssistant &&
+			len(assistant.ToolCalls) > 0 &&
+			!hasDetailText(assistant.ReasoningDetails) &&
+			requiresReasoningReplay(model) {
+			placeholder := reasoningReplayPlaceholder
+			assistant.Reasoning = &placeholder
+		}
+
+		// When the caller sent no details array, the decoder synthesized one from
+		// the value it saw before this normalization, which may be the losing
+		// spelling. Rebuild it from the value that actually wins so the replayed
+		// reasoning and its details cannot disagree. The rebuilt entry is marked
+		// synthesized, so outbound replay sends the text instead of these details.
+		if len(raw[i].ReasoningDetails) == 0 && assistant.Reasoning != nil {
+			text := *assistant.Reasoning
+			assistant.ReasoningDetails = []schemas.ChatReasoningDetails{{
+				Index: 0,
+				Type:  schemas.BifrostReasoningDetailsTypeText,
+				Text:  &text,
+			}}
+			assistant.ReasoningDetailsSynthesized = true
+		}
+	}
+}
+
+// reasoningReplayPlaceholder is the reasoning text replayed on an assistant
+// tool-call turn whose real reasoning is unavailable. One character, because a
+// thinking-mode upstream treats an empty string as missing.
+const reasoningReplayPlaceholder = "."
+
+// requiresReasoningReplay reports whether the request model reaches an upstream
+// that enforces the reasoning replay contract. Only DeepSeek-shaped routes were
+// measured to reject an absent or empty replay; other models keep the caller's
+// exact history.
+func requiresReasoningReplay(model string) bool {
+	return strings.Contains(strings.ToLower(model), "deepseek")
+}
+
+// explicitReasoning returns the first non-empty explicit reasoning spelling, in
+// precedence order, with the name of the spelling that supplied it. An empty
+// string counts as absent. Both results are zero when no spelling carries text.
+func explicitReasoning(raw nativeRawReasoning) (*string, string) {
+	for _, c := range []struct {
+		text   *string
+		source string
+	}{
+		{raw.ReasoningContent, "reasoning_content"},
+		{raw.Reasoning, "reasoning"},
+		{raw.ReasoningText, "reasoning_text"},
+	} {
+		if c.text != nil && *c.text != "" {
+			return c.text, c.source
+		}
+	}
+	return nil, ""
+}
+
+// hasDetailText reports whether any reasoning detail carries non-empty text.
+func hasDetailText(details []schemas.ChatReasoningDetails) bool {
+	for _, detail := range details {
+		if detail.Text != nil && *detail.Text != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // ResponsesRequestInput is a union of string and array of responses messages

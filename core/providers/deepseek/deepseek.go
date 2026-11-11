@@ -105,10 +105,13 @@ func applyDeepSeekThinkingCompatibility(request *schemas.BifrostChatRequest) *sc
 //     support this tool_choice" while thinking is enabled.
 //  2. A history containing an assistant tool_call turn that carries no replayable
 //     reasoning. DeepSeek requires reasoning_content to be replayed on tool_call turns and
-//     400s without it; when the caller cannot supply it, thinking has to stay off. Only
-//     ChatAssistantMessage.Reasoning counts here - reasoning_details is inbound-only and
-//     never reaches the wire - and this is judged from the messages alone, since a caller
-//     may replay tool_call turns without re-declaring Params.Tools.
+//     400s without it; when the caller cannot supply it, thinking has to stay off. Reasoning
+//     text counts from either source: ChatAssistantMessage.Reasoning, or the text of any
+//     ReasoningDetails entry. The outbound converter folds that detail text into the wire
+//     reasoning field, so under the default setting a details-only turn reaches DeepSeek as
+//     reasoning_content. A detail with only a signature carries no text and does not count.
+//     This is judged from the messages alone, since a caller may replay tool_call turns
+//     without re-declaring Params.Tools.
 //
 // Everything else keeps thinking on. In particular, a plain multi-turn conversation needs no
 // reasoning replay whatsoever — per DeepSeek's thinking-mode guide, "the intermediate
@@ -143,16 +146,30 @@ func requiresDeepSeekThinkingDisabled(request *schemas.BifrostChatRequest) bool 
 		if len(msg.ChatAssistantMessage.ToolCalls) == 0 {
 			continue
 		}
-		// Only Reasoning can satisfy the replay requirement: it is the sole field
-		// ConvertBifrostMessagesToOpenAIMessages copies onto the outbound assistant
-		// message, as reasoning_content. ReasoningDetails is inbound-only and never
-		// reaches the wire (see core/providers/openai/types.go), so a details-only turn
-		// would keep thinking on and then 400 for the missing reasoning_content.
-		if msg.ChatAssistantMessage.Reasoning == nil {
+		// Reasoning text satisfies the replay requirement from either source. The outbound
+		// converter sends Reasoning, and when that is empty it folds the first
+		// reasoning_details text into the same wire field (core/providers/openai/utils.go).
+		// A turn with neither keeps no replayable reasoning, so thinking has to be off.
+		if !hasReasoningText(msg.ChatAssistantMessage) {
 			return true
 		}
 	}
 
+	return false
+}
+
+// hasReasoningText reports whether a message carries reasoning text the outbound converter
+// can send: a non-empty Reasoning, or a reasoning_details entry with non-empty text. Empty
+// text counts as absent, as it does in the converter.
+func hasReasoningText(msg *schemas.ChatAssistantMessage) bool {
+	if msg.Reasoning != nil && *msg.Reasoning != "" {
+		return true
+	}
+	for _, detail := range msg.ReasoningDetails {
+		if detail.Text != nil && *detail.Text != "" {
+			return true
+		}
+	}
 	return false
 }
 

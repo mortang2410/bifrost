@@ -161,6 +161,69 @@ const (
 // is off — i.e. reasoning.effort is "none" or omitted.
 const ConditionWhenEffortNone = "when_effort_none"
 
+// Accepted values of the reasoning replay setting: the wire field name upstream
+// accepts for replayed assistant reasoning, or one of the sentinels auto and none.
+// ResolveReasoningReplayField returns a recognised value unchanged, and returns
+// ReasoningReplayAuto when no source names a recognised value.
+const (
+	ReasoningReplayAuto             = "auto"
+	ReasoningReplayNone             = "none"
+	ReasoningReplayReasoning        = "reasoning"
+	ReasoningReplayReasoningContent = "reasoning_content"
+	ReasoningReplayReasoningText    = "reasoning_text"
+	ReasoningReplayReasoningDetails = "reasoning_details"
+)
+
+// ReasoningReplayField returns the datasheet's reasoning replay field, or fallback
+// when the record does not set one. The value is not validated here, because
+// ResolveReasoningReplayField does that.
+func (c ModelCaps) ReasoningReplayField(fallback string) string {
+	if c.record != nil && c.record.ReasoningReplayField != "" {
+		return c.record.ReasoningReplayField
+	}
+	return fallback
+}
+
+// ResolveReasoningReplayField returns the reasoning replay value for one request
+// model. The sources are checked in this order, and the first non-empty one decides:
+// the per-model entry custom.ReasoningReplayFields[model] (skipped when model is
+// empty), then custom.ReasoningReplayField, then the datasheet record in caps, then
+// auto. A recognised value is returned unchanged, including auto and none. An
+// unrecognised value resolves to auto and stops the search, so a lower-priority
+// source is never consulted. Matching is exact: the configured value is not trimmed
+// or case-folded. custom may be nil.
+func ResolveReasoningReplayField(model string, custom *CustomProviderConfig, caps ModelCaps) string {
+	var candidates [3]string
+	if custom != nil {
+		if model != "" {
+			candidates[0] = custom.ReasoningReplayFields[model]
+		}
+		candidates[1] = custom.ReasoningReplayField
+	}
+	candidates[2] = caps.ReasoningReplayField("")
+	for _, field := range candidates {
+		if field == "" {
+			continue
+		}
+		if !isValidReasoningReplayField(field) {
+			return ReasoningReplayAuto
+		}
+		return field
+	}
+	return ReasoningReplayAuto
+}
+
+// isValidReasoningReplayField reports whether v is one of the accepted values. The
+// comparison is exact.
+func isValidReasoningReplayField(v string) bool {
+	switch v {
+	case ReasoningReplayAuto, ReasoningReplayNone, ReasoningReplayReasoning,
+		ReasoningReplayReasoningContent, ReasoningReplayReasoningText, ReasoningReplayReasoningDetails:
+		return true
+	}
+	return false
+}
+
 // FieldUnsupported reports whether the provider rejects a wire field outright.
 // fallback is returned when the datasheet says nothing about the field, so each
 // call site keeps its own name-based default until the feed carries the row.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/tidwall/gjson"
@@ -1293,6 +1294,10 @@ const (
 	ChatContentBlockTypeInputAudio ChatContentBlockType = "input_audio"
 	ChatContentBlockTypeFile       ChatContentBlockType = "file"
 	ChatContentBlockTypeRefusal    ChatContentBlockType = "refusal"
+	// ChatContentBlockTypeThinking is Mistral's replay form for assistant
+	// reasoning: a content block whose own array carries text chunks, instead of
+	// a sibling reasoning field the provider's closed schema rejects.
+	ChatContentBlockTypeThinking ChatContentBlockType = "thinking"
 )
 
 // ChatContentBlock represents a content block in a message.
@@ -1303,6 +1308,10 @@ type ChatContentBlock struct {
 	ImageURLStruct *ChatInputImage      `json:"image_url,omitempty"`
 	InputAudio     *ChatInputAudio      `json:"input_audio,omitempty"`
 	File           *ChatInputFile       `json:"file,omitempty"`
+
+	// Thinking carries the nested text chunks of a "thinking" block, the shape
+	// Mistral accepts for replayed assistant reasoning.
+	Thinking []ChatContentBlock `json:"thinking,omitempty"`
 
 	// Not in OpenAI's schemas, but sent by a few providers (Anthropic, Bedrock are some of them)
 	CacheControl *CacheControl `json:"cache_control,omitempty"`
@@ -1564,12 +1573,22 @@ type ChatToolMessage struct {
 
 // ChatAssistantMessage represents a message in a chat conversation.
 type ChatAssistantMessage struct {
-	Refusal          *string                          `json:"refusal"`
-	Audio            *ChatAudioMessageAudio           `json:"audio,omitempty"`
-	Reasoning        *string                          `json:"reasoning,omitempty"`
+	Refusal   *string                `json:"refusal"`
+	Audio     *ChatAudioMessageAudio `json:"audio,omitempty"`
+	Reasoning *string                `json:"reasoning,omitempty"`
+	// ReasoningSource names the spelling that produced Reasoning: "reasoning",
+	// "reasoning_content", or "reasoning_text" when set by UnmarshalJSON. The OpenAI-wire
+	// request converter may also set "reasoning_details". Empty when Reasoning is empty.
+	// Never serialized.
+	ReasoningSource  string                           `json:"-"`
 	ReasoningDetails []ChatReasoningDetails           `json:"reasoning_details,omitempty"`
 	Annotations      []ChatAssistantMessageAnnotation `json:"annotations,omitempty"`
 	ToolCalls        []ChatAssistantMessageToolCall   `json:"tool_calls,omitempty"`
+	// ReasoningDetailsSynthesized is true when Bifrost built ReasoningDetails from Reasoning
+	// text, in UnmarshalJSON or in native request ingress, and the payload carried no
+	// structured details. Outbound replay sends the text rather than those synthesized
+	// details under the reasoning_details setting. Never serialized.
+	ReasoningDetailsSynthesized bool `json:"-"`
 }
 
 // MarshalJSON emits reasoning under both spellings the ecosystem uses.
@@ -1610,8 +1629,19 @@ func (cm ChatAssistantMessage) MarshalJSON() ([]byte, error) {
 }
 
 // UnmarshalJSON implements custom unmarshalling for ChatAssistantMessage.
+// Reasoning text may arrive under three spellings: reasoning, reasoning_content
+// (xAI and DeepSeek), and reasoning_text. The first non-empty one wins, in that
+// order, and ReasoningSource records which one won.
 // If Reasoning is non-nil and ReasoningDetails is nil/empty, it adds a single
-// ChatReasoningDetails entry of type "reasoning.text" with the text set to Reasoning.
+// ChatReasoningDetails entry of type "reasoning.text" with the text set to Reasoning,
+// and sets ReasoningDetailsSynthesized so replay can tell that entry from details the
+// payload carried.
+//
+// This type is both the request and the response shape, so it deliberately does
+// NOT promote reasoning_details text into Reasoning. Doing so here would rewrite
+// provider responses as they are decoded. Native request ingress re-resolves the
+// spellings in the handlers package, on the request type only, because its
+// precedence differs.
 func (cm *ChatAssistantMessage) UnmarshalJSON(data []byte) error {
 	if cm == nil {
 		return nil
@@ -1620,10 +1650,11 @@ func (cm *ChatAssistantMessage) UnmarshalJSON(data []byte) error {
 	// Alias to avoid infinite recursion
 	type Alias ChatAssistantMessage
 
-	// Auxiliary struct to capture xAI's reasoning_content field
+	// Auxiliary struct to capture the spellings Alias does not carry
 	var aux struct {
 		Alias
-		ReasoningContent *string `json:"reasoning_content,omitempty"` // xAI uses this field name
+		ReasoningContent *string `json:"reasoning_content,omitempty"` // xAI and DeepSeek use this field name
+		ReasoningText    *string `json:"reasoning_text,omitempty"`
 	}
 
 	if err := Unmarshal(data, &aux); err != nil {
@@ -1633,21 +1664,23 @@ func (cm *ChatAssistantMessage) UnmarshalJSON(data []byte) error {
 	// Copy decoded data back into the original type
 	*cm = ChatAssistantMessage(aux.Alias)
 
-	// Map xAI's reasoning_content to Bifrost's Reasoning field
-	// This allows both OpenAI's "reasoning" and xAI's "reasoning_content" to work
-	if aux.ReasoningContent != nil && cm.Reasoning == nil {
-		cm.Reasoning = aux.ReasoningContent
+	// Resolve Reasoning: the first non-empty spelling wins. An empty value counts as
+	// absent, so it is never kept as a non-nil Reasoning. DeepSeek-shaped upstreams
+	// (ModelScope) keep sending empty reasoning fields on every content-phase frame
+	// once thinking has ended. Folding "" into a non-nil Reasoning made MarshalJSON
+	// re-emit it under both spellings and synthesize an empty details entry below,
+	// which reasoning-aware clients render as a fresh thinking block per chunk
+	// (#7294). Empty means absent.
+	cm.Reasoning, cm.ReasoningSource = nil, ""
+	switch {
+	case aux.Reasoning != nil && *aux.Reasoning != "":
+		cm.Reasoning, cm.ReasoningSource = aux.Reasoning, "reasoning"
+	case aux.ReasoningContent != nil && *aux.ReasoningContent != "":
+		cm.Reasoning, cm.ReasoningSource = aux.ReasoningContent, "reasoning_content"
+	case aux.ReasoningText != nil && *aux.ReasoningText != "":
+		cm.Reasoning, cm.ReasoningSource = aux.ReasoningText, "reasoning_text"
 	}
-
-	// DeepSeek-shaped upstreams (ModelScope) keep sending empty reasoning fields
-	// on every content-phase frame once thinking has ended. Folding "" into a
-	// non-nil Reasoning made MarshalJSON re-emit it under both spellings and
-	// synthesize an empty details entry below, which reasoning-aware clients
-	// render as a fresh thinking block per chunk (#7294). Empty means absent.
 	cm.ReasoningDetails = pruneEmptyReasoningDetails(cm.ReasoningDetails)
-	if cm.Reasoning != nil && *cm.Reasoning == "" {
-		cm.Reasoning = nil
-	}
 
 	// If Reasoning is present and there are no reasoning_details,
 	// synthesize a text reasoning_details entry.
@@ -1660,6 +1693,7 @@ func (cm *ChatAssistantMessage) UnmarshalJSON(data []byte) error {
 				Text:  &text,
 			},
 		}
+		cm.ReasoningDetailsSynthesized = true
 	}
 
 	return nil
@@ -1855,10 +1889,92 @@ func (d ChatStreamResponseChoiceDelta) MarshalJSON() ([]byte, error) {
 	})
 }
 
+// fallbackTypedContentChunk is one element of a Mistral-style typed content
+// array: either a "text" chunk carrying a string, or a "thinking" chunk whose
+// own array carries text parts. Mistral streams reasoning this way instead of
+// using a sibling reasoning_content field, so a delta typed as Content *string
+// fails to decode and the frame is dropped by the caller.
+type fallbackTypedContentChunk struct {
+	Type     string `json:"type"`
+	Text     string `json:"text"`
+	Thinking []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"thinking"`
+}
+
+// foldTypedContentChunks rewrites a stream delta whose "content" is an array of
+// typed chunks into the string form Bifrost models: text parts are concatenated
+// into content and thinking parts into the reasoning field. It reports false,
+// leaving the payload untouched, whenever the delta is not in that shape.
+func foldTypedContentChunks(data []byte) ([]byte, bool) {
+	if !bytes.Contains(data, []byte(`"content":[`)) && !bytes.Contains(data, []byte(`"content": [`)) {
+		return nil, false
+	}
+
+	content := gjson.GetBytes(data, "content")
+	if !content.IsArray() {
+		return nil, false
+	}
+	var chunks []fallbackTypedContentChunk
+	if err := Unmarshal([]byte(content.Raw), &chunks); err != nil {
+		return nil, false
+	}
+
+	var text, thinking bytes.Buffer
+	for _, chunk := range chunks {
+		switch strings.ToLower(chunk.Type) {
+		case "text":
+			text.WriteString(chunk.Text)
+		case "thinking":
+			for _, part := range chunk.Thinking {
+				thinking.WriteString(part.Text)
+			}
+		}
+	}
+
+	// An array always folds, even with no usable part: leaving it alone makes the
+	// caller drop the frame, which is exactly the loss this exists to prevent.
+	out := append([]byte(nil), data...)
+	var err error
+	if text.Len() > 0 {
+		out, err = sjson.SetBytes(out, "content", text.String())
+		if err != nil {
+			return nil, false
+		}
+	} else {
+		// A thinking-only frame carries no visible text; dropping the key keeps
+		// the emitted delta free of an empty content string.
+		out, err = sjson.DeleteBytes(out, "content")
+		if err != nil {
+			return nil, false
+		}
+	}
+	if thinking.Len() > 0 {
+		merged := thinking.String()
+		if existing := gjson.GetBytes(out, "reasoning"); existing.Type == gjson.String && existing.String() != "" {
+			// A sibling reasoning key is part of the same phase; append instead of
+			// discarding the typed thinking this frame carries.
+			merged = existing.String() + merged
+		}
+		out, err = sjson.SetBytes(out, "reasoning", merged)
+		if err != nil {
+			return nil, false
+		}
+	}
+	return out, true
+}
+
 // UnmarshalJSON implements custom unmarshalling for ChatStreamResponseChoiceDelta.
 // If Reasoning is non-nil and ReasoningDetails is nil/empty, it adds a single
 // ChatReasoningDetails entry of type "reasoning.text" with the text set to Reasoning.
 func (d *ChatStreamResponseChoiceDelta) UnmarshalJSON(data []byte) error {
+	// A provider that streams typed content chunks (Mistral) is folded to the
+	// string shape first; every other delta passes through untouched.
+	if folded, ok := foldTypedContentChunks(data); ok {
+		data = folded
+	}
+
 	// Alias to avoid infinite recursion
 	type Alias ChatStreamResponseChoiceDelta
 

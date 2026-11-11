@@ -249,13 +249,11 @@ func TestChatCompletion_OpenAIEndpointDisablesThinkingForToolCallWithoutReasonin
 	}
 }
 
-// TestChatCompletion_OpenAIEndpointDisablesThinkingForToolCallWithReasoningDetailsOnly
-// covers a tool-call turn whose reasoning is carried only as reasoning_details.
-// ReasoningDetails is inbound-only -- ConvertBifrostMessagesToOpenAIMessages copies
-// Reasoning into reasoning_content and never populates reasoning_details (see
-// core/providers/openai/types.go) -- so nothing reaches the wire to satisfy DeepSeek's
-// replay requirement and thinking must be forced off.
-func TestChatCompletion_OpenAIEndpointDisablesThinkingForToolCallWithReasoningDetailsOnly(t *testing.T) {
+// TestChatCompletion_OpenAIEndpointKeepsThinkingForToolCallWithReasoningDetailsOnly covers a
+// tool-call turn whose reasoning is carried only as reasoning_details. Under the default
+// setting the outbound converter sends that detail text as reasoning_content, so DeepSeek
+// receives the reasoning it requires on the tool-call turn and thinking stays on.
+func TestChatCompletion_OpenAIEndpointKeepsThinkingForToolCallWithReasoningDetailsOnly(t *testing.T) {
 	t.Parallel()
 
 	chatTool := llmtests.GetSampleChatTool(llmtests.SampleToolTypeTime)
@@ -300,19 +298,18 @@ func TestChatCompletion_OpenAIEndpointDisablesThinkingForToolCallWithReasoningDe
 		},
 	})
 
-	// The premise: reasoning_details never reaches DeepSeek, so the tool-call turn
-	// really does go out with no replayed reasoning.
+	// The premise: the detail text goes out as reasoning_content on the tool-call turn,
+	// and, under the default setting, reasoning_details itself is not sent on the wire.
 	toolCallMsg := assistantMessageAt(t, captured, 1)
-	if got, ok := toolCallMsg["reasoning_content"]; ok {
-		t.Fatalf("reasoning_details must not reach the wire as reasoning_content, got %#v", got)
+	if got, ok := toolCallMsg["reasoning_content"].(string); !ok || got != reasoning {
+		t.Fatalf("reasoning_details text must reach the wire as reasoning_content, got %#v", toolCallMsg["reasoning_content"])
+	}
+	if got, ok := toolCallMsg["reasoning_details"]; ok {
+		t.Fatalf("reasoning_details must not reach the wire, got %#v", got)
 	}
 
-	thinking, ok := captured["thinking"].(map[string]any)
-	if !ok {
-		t.Fatalf("expected thinking block in outbound body, got %#v", captured)
-	}
-	if got := thinking["type"]; got != "disabled" {
-		t.Fatalf("thinking.type = %v, want disabled", got)
+	if thinking, ok := captured["thinking"]; ok {
+		t.Fatalf("thinking must stay on when tool-call reasoning is replayed from reasoning_details, got %#v", thinking)
 	}
 }
 

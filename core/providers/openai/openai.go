@@ -872,6 +872,7 @@ func (provider *OpenAIProvider) ChatCompletion(ctx *schemas.BifrostContext, key 
 		nil,
 		nil,
 		provider.logger,
+		provider.customProviderConfig,
 	)
 }
 
@@ -898,7 +899,17 @@ func timedExtractResponseHeaders(ctx *schemas.BifrostContext, resp *fasthttp.Res
 	return headers
 }
 
+// firstCustomProviderConfig returns the optional custom provider config a handler was
+// given, or nil when the caller gave none.
+func firstCustomProviderConfig(configs []*schemas.CustomProviderConfig) *schemas.CustomProviderConfig {
+	if len(configs) == 0 {
+		return nil
+	}
+	return configs[0]
+}
+
 // HandleOpenAIChatCompletionRequest handles a chat completion request to OpenAI's API.
+// customProviderConfig is optional; it supplies the per-model reasoning replay field.
 func HandleOpenAIChatCompletionRequest(
 	ctx *schemas.BifrostContext,
 	client *fasthttp.Client,
@@ -913,6 +924,7 @@ func HandleOpenAIChatCompletionRequest(
 	customErrorConverter ErrorConverter,
 	signer providerUtils.BodySigner,
 	logger schemas.Logger,
+	customProviderConfig ...*schemas.CustomProviderConfig,
 ) (*schemas.BifrostChatResponse, *schemas.BifrostError) {
 	// Create request
 	req := fasthttp.AcquireRequest()
@@ -962,7 +974,7 @@ func HandleOpenAIChatCompletionRequest(
 		ctx,
 		request,
 		func() (providerUtils.RequestBodyWithExtraParams, error) {
-			reqBody := ToOpenAIChatRequest(ctx, request)
+			reqBody := toOpenAIChatRequest(ctx, request, firstCustomProviderConfig(customProviderConfig))
 			// Resolved here rather than inside the converter, so a failed document fetch surfaces
 			// as itself instead of as a provider 400 about a missing file_id.
 			if err := ResolveChatFileURLs(ctx, request.Provider, reqBody); err != nil {
@@ -1111,6 +1123,7 @@ func (provider *OpenAIProvider) ChatCompletionStream(ctx *schemas.BifrostContext
 		nil,
 		provider.logger,
 		postHookSpanFinalizer,
+		provider.customProviderConfig,
 	)
 }
 
@@ -1136,6 +1149,7 @@ func HandleOpenAIChatCompletionStreaming(
 	signer providerUtils.BodySigner,
 	logger schemas.Logger,
 	postHookSpanFinalizer func(context.Context),
+	customProviderConfig ...*schemas.CustomProviderConfig,
 ) (chan *schemas.BifrostStreamChunk, *schemas.BifrostError) {
 	providerUtils.SetStreamIdleTimeoutIfEmpty(ctx, streamIdleTimeoutInSeconds)
 	// Check if the request is a redirect from ResponsesStream to ChatCompletionStream
@@ -1167,7 +1181,7 @@ func HandleOpenAIChatCompletionStreaming(
 			if customRequestConverter != nil {
 				return customRequestConverter(request)
 			}
-			reqBody := ToOpenAIChatRequest(ctx, request)
+			reqBody := toOpenAIChatRequest(ctx, request, firstCustomProviderConfig(customProviderConfig))
 			// Same resolution the non-streaming path does: streaming rejects file_url just as
 			// hard, so a URL-sourced document has to be inlined here too.
 			if err := ResolveChatFileURLs(ctx, request.Provider, reqBody); err != nil {

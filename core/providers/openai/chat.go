@@ -26,19 +26,43 @@ func (req *OpenAIChatRequest) ToBifrostChatRequest(ctx *schemas.BifrostContext) 
 
 // ToOpenAIChatRequest converts a Bifrost chat completion request to OpenAI format
 func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.BifrostChatRequest) *OpenAIChatRequest {
+	return toOpenAIChatRequest(ctx, bifrostReq, nil)
+}
+
+// ToOpenAIChatRequestForProvider is ToOpenAIChatRequest under a provider's custom config,
+// which can name the reasoning replay field per model. It runs the same conversion the
+// provider's own request path runs, so a caller outside this package can check the wire
+// body a configured replay field produces.
+func ToOpenAIChatRequestForProvider(ctx *schemas.BifrostContext, bifrostReq *schemas.BifrostChatRequest, custom *schemas.CustomProviderConfig) *OpenAIChatRequest {
+	return toOpenAIChatRequest(ctx, bifrostReq, custom)
+}
+
+// toOpenAIChatRequest is ToOpenAIChatRequest with the provider's custom config, which can
+// name the reasoning replay field per model. custom may be nil.
+func toOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.BifrostChatRequest, custom *schemas.CustomProviderConfig) *OpenAIChatRequest {
 	if bifrostReq == nil || bifrostReq.Input == nil {
 		return nil
-	}
-
-	openaiReq := &OpenAIChatRequest{
-		Model:    bifrostReq.Model,
-		Messages: ConvertBifrostMessagesToOpenAIMessages(bifrostReq.Input),
-		Provider: bifrostReq.Provider,
 	}
 
 	// Canonical model for capability gating only; wire model (openaiReq.Model) is untouched.
 	capModel := schemas.ResolveCanonicalModel(ctx, bifrostReq.Model)
 	caps := schemas.ResolveModelCaps(bifrostReq.Provider, capModel)
+
+	// The per-model replay map is keyed by the model id the caller named. Once an alias
+	// resolves, bifrostReq.Model holds the upstream id, and the caller's alias is kept in
+	// the context, so an aliased request looks up that alias. A request that names the
+	// upstream id directly looks up that id.
+	replayModel := bifrostReq.Model
+	if ra := schemas.GetResolvedAlias(ctx); ra != nil && ra.Key != "" {
+		replayModel = ra.Key
+	}
+	field := schemas.ResolveReasoningReplayField(replayModel, custom, caps)
+
+	openaiReq := &OpenAIChatRequest{
+		Model:    bifrostReq.Model,
+		Messages: convertBifrostMessagesToOpenAIMessages(bifrostReq.Input, field),
+		Provider: bifrostReq.Provider,
+	}
 
 	if bifrostReq.Params != nil {
 		openaiReq.ChatParameters = *bifrostReq.Params
@@ -123,7 +147,20 @@ func ToOpenAIChatRequest(ctx *schemas.BifrostContext, bifrostReq *schemas.Bifros
 		openaiReq.ServiceTier = nil
 		return openaiReq
 	case schemas.Mistral:
+		// Mistral documents a closed reasoning_effort enum (none, minimal, low,
+		// medium, high, xhigh, max) and rejects a level outside it with a
+		// validation error rather than a fallback. Keep the caller's level
+		// instead of snapping it onto the model's ladder, so Mistral receives
+		// the level the caller asked for; applyMistralCompatibility forwards it
+		// unchanged for the same reason.
+		requestedEffort := (*string)(nil)
+		if openaiReq.Reasoning != nil {
+			requestedEffort = openaiReq.Reasoning.Effort
+		}
 		openaiReq.filterOpenAISpecificParameters(caps)
+		if requestedEffort != nil && openaiReq.Reasoning != nil {
+			openaiReq.Reasoning.Effort = requestedEffort
+		}
 		openaiReq.applyMistralCompatibility()
 		return openaiReq
 	case schemas.OpencodeGo, schemas.OpencodeZen:
@@ -277,12 +314,121 @@ func (req *OpenAIChatRequest) applyMistralCompatibility() {
 		req.ToolChoice.ChatToolChoiceStruct = nil
 	}
 
-	// Mistral only support reasoning effort "none" and "high"
-	if req.Reasoning != nil && req.Reasoning.Effort != nil {
-		if *req.Reasoning.Effort != "none" && *req.Reasoning.Effort != "high" {
-			req.Reasoning.Effort = schemas.Ptr("high")
+	// Mistral documents a closed reasoning_effort enum (none, minimal, low, medium,
+	// high, xhigh, max) and answers a value outside it with a validation error
+	// rather than a fallback. The caller's level is forwarded unchanged: rewriting
+	// it would report a level upstream the provider never ran.
+
+	// Mistral's message schema is closed (additionalProperties: false) and rejects
+	// the sibling reasoning spellings with 422 extra_forbidden. Its own replay form
+	// is a "thinking" content chunk, so replayed assistant reasoning moves into the
+	// content array instead of travelling beside it.
+	// The assistant struct is nil on a plain content turn (a caller replaying the
+	// provider's own thinking form carries no sibling reasoning), so the content
+	// fold runs for every message and the sibling cleanup only where the struct
+	// exists.
+	for i := range req.Messages {
+		assistantMessage := req.Messages[i].OpenAIChatAssistantMessage
+		var texts []string
+		if assistantMessage != nil {
+			texts = mistralReplayedReasoning(assistantMessage)
+		}
+		// A caller that replayed the provider's own form twice must be folded even
+		// when there is no sibling reasoning to add: Mistral answers two leading
+		// ThinkChunks with 400 invalid_request_invalid_args.
+		if len(texts) > 0 || hasLeadingThinkingSiblings(req.Messages[i].Content) {
+			req.Messages[i].Content = mistralThinkingContent(req.Messages[i].Content, texts)
+		}
+		if assistantMessage != nil {
+			assistantMessage.Reasoning = nil
+			assistantMessage.ReasoningAlias = nil
+			assistantMessage.ReasoningText = nil
+			assistantMessage.ReasoningDetails = nil
 		}
 	}
+}
+
+// hasLeadingThinkingSiblings reports whether content carries more than one leading
+// thinking chunk, the shape Mistral rejects with "Expected at most one leading
+// ThinkChunk". Mistral accepts one, so the fold must run for it even when there is
+// no replayed reasoning text to append.
+func hasLeadingThinkingSiblings(content *schemas.ChatMessageContent) bool {
+	return content != nil && len(content.ContentBlocks) > 1 &&
+		content.ContentBlocks[0].Type == schemas.ChatContentBlockTypeThinking &&
+		content.ContentBlocks[1].Type == schemas.ChatContentBlockTypeThinking
+}
+
+// mistralReplayedReasoning returns the assistant text to replay as Mistral thinking
+// chunks. A sibling spelling wins over the structured details, and every non-empty
+// detail text is kept: taking only the first one silently loses reasoning the
+// provider produced and billed, and an empty first text would lose all of it.
+func mistralReplayedReasoning(assistantMessage *OpenAIChatAssistantMessage) []string {
+	for _, sibling := range []*string{assistantMessage.Reasoning, assistantMessage.ReasoningAlias, assistantMessage.ReasoningText} {
+		if sibling != nil && *sibling != "" {
+			return []string{*sibling}
+		}
+	}
+	texts := make([]string, 0, len(assistantMessage.ReasoningDetails))
+	for _, details := range assistantMessage.ReasoningDetails {
+		if details.Text != nil && *details.Text != "" {
+			texts = append(texts, *details.Text)
+		}
+	}
+	return texts
+}
+
+// mistralThinkingContent puts the replayed reasoning into the assistant content as
+// Mistral's own replay form: one leading "thinking" chunk followed by the caller's
+// content. Mistral accepts at most one leading ThinkChunk ("Expected at most one
+// leading ThinkChunk, got 2"), so a caller that already sent one keeps it and the
+// reasoning joins it; duplicate text is not replayed twice.
+func mistralThinkingContent(content *schemas.ChatMessageContent, texts []string) *schemas.ChatMessageContent {
+	if content != nil && len(content.ContentBlocks) > 0 && content.ContentBlocks[0].Type == schemas.ChatContentBlockTypeThinking {
+		blocks := make([]schemas.ChatContentBlock, len(content.ContentBlocks))
+		copy(blocks, content.ContentBlocks)
+		merged := append([]schemas.ChatContentBlock{}, blocks[0].Thinking...)
+		for len(blocks) > 1 && blocks[1].Type == schemas.ChatContentBlockTypeThinking {
+			merged = append(merged, blocks[1].Thinking...)
+			blocks = append(blocks[:1], blocks[2:]...)
+		}
+		blocks[0].Thinking = appendThinkingTexts(merged, texts)
+		return &schemas.ChatMessageContent{ContentBlocks: blocks}
+	}
+	blocks := []schemas.ChatContentBlock{{
+		Type:     schemas.ChatContentBlockTypeThinking,
+		Thinking: appendThinkingTexts(nil, texts),
+	}}
+	if content != nil {
+		switch {
+		case content.ContentBlocks != nil:
+			blocks = append(blocks, content.ContentBlocks...)
+		case content.ContentStr != nil:
+			blocks = append(blocks, schemas.ChatContentBlock{Type: schemas.ChatContentBlockTypeText, Text: content.ContentStr})
+		}
+	}
+	return &schemas.ChatMessageContent{ContentBlocks: blocks}
+}
+
+// appendThinkingTexts appends one text chunk per entry, skipping a text the chunk
+// already carries, so a caller that sent the same reasoning twice does not replay
+// it twice.
+func appendThinkingTexts(parts []schemas.ChatContentBlock, texts []string) []schemas.ChatContentBlock {
+	out := append([]schemas.ChatContentBlock{}, parts...)
+	for _, text := range texts {
+		duplicate := false
+		for _, part := range out {
+			if part.Text != nil && *part.Text == text {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		value := text
+		out = append(out, schemas.ChatContentBlock{Type: schemas.ChatContentBlockTypeText, Text: &value})
+	}
+	return out
 }
 
 // stripReasoningDetailsExceptToolCalls strips reasoning_content from assistant messages that
