@@ -2156,9 +2156,12 @@ func TestToOpenAIChatRequest_MistralKeepsPromptCacheKey(t *testing.T) {
 	require.NotNil(t, result.PromptCacheKey, "Mistral documents prompt_cache_key; it must not be stripped")
 	require.Equal(t, cacheKey, *result.PromptCacheKey)
 
-	// The same request on a compat provider still strips it.
-	bifrostReq.Provider = schemas.Fireworks
-	compat := ToOpenAIChatRequest(ctx, bifrostReq)
-	require.NotNil(t, compat)
-	require.Nil(t, compat.PromptCacheKey, "compat providers keep the fail-closed default")
+	// Every other provider still strips it, so a second provider exception
+	// cannot slip in unnoticed.
+	for _, provider := range []schemas.ModelProvider{schemas.Fireworks, schemas.Vertex} {
+		bifrostReq.Provider = provider
+		compat := ToOpenAIChatRequest(ctx, bifrostReq)
+		require.NotNil(t, compat)
+		require.Nil(t, compat.PromptCacheKey, "provider %s must keep the fail-closed default", provider)
+	}
 }
